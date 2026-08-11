@@ -41,8 +41,6 @@ import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
-import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
@@ -335,6 +333,11 @@ class LedgerEngineConcurrencyIT {
             try (AccountLockManager.LockHandle handle = lockManager.lockAll(
                     List.of(cash.getId(), customer.getId()),
                     Duration.ofSeconds(1), Duration.ofSeconds(20))) {
+                // Referenced so the handle is not an unused auto-closeable, and asserted on: the
+                // holder must genuinely own both accounts before the main thread tries to acquire.
+                if (handle.accountIds().size() != 2 || !handle.stillHeld()) {
+                    throw new IllegalStateException("holder did not acquire both account locks");
+                }
                 acquired.countDown();
                 release.await();
             } catch (InterruptedException e) {

@@ -24,7 +24,6 @@ import com.apex.ledger.infrastructure.persistence.repository.OutboxEventReposito
 import com.apex.ledger.infrastructure.persistence.repository.TransactionRepository;
 import io.github.resilience4j.ratelimiter.RateLimiter;
 import io.github.resilience4j.ratelimiter.RateLimiterRegistry;
-import io.github.resilience4j.ratelimiter.RequestNotPermitted;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import org.junit.jupiter.api.DisplayName;

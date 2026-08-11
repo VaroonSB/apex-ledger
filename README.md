@@ -11,6 +11,9 @@ Kafka 4 (KRaft)
 
 ---
 
+**Setting this up locally?** See [`docs/LOCAL_SETUP.md`](docs/LOCAL_SETUP.md) for Mac-specific steps,
+a post-setup verification checklist, and what must change before this goes anywhere real.
+
 ## Quick start
 
 ```bash
