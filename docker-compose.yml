@@ -1,0 +1,370 @@
+# ---------------------------------------------------------------------------
+# ApexLedger — local infrastructure plane
+#
+# Brings up the three stateful dependencies the engine talks to:
+#   postgres : system of record, holds the append-only journal
+#   redis    : idempotency keys, distributed transfer leases, balance snapshots
+#   kafka    : immutable outbound event log, KRaft mode (no ZooKeeper)
+#
+#   docker compose up -d          # start, then wait for all three to report healthy
+#   docker compose ps             # confirm STATUS is "healthy", not merely "running"
+#   docker compose down           # stop, preserving volumes
+#   docker compose down -v        # stop and destroy all ledger data
+#
+# Host-facing ports are 5432 / 6379 / 9092, matching the defaults baked into
+# src/main/resources/application.yml, so the app runs with no extra env vars.
+# ---------------------------------------------------------------------------
+
+name: apex-ledger
+
+services:
+
+  # =========================================================================
+  # PostgreSQL 16 — system of record
+  # =========================================================================
+  postgres:
+    image: postgres:16.14-alpine
+    container_name: apex-ledger-postgres
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+    environment:
+      POSTGRES_DB: apex_ledger
+      POSTGRES_USER: apex
+      POSTGRES_PASSWORD: apex_local_dev
+      # Deterministic byte-order collation. Locale-sensitive collations change sort
+      # order across glibc/musl upgrades, which silently corrupts index ordering.
+      POSTGRES_INITDB_ARGS: "--data-checksums --encoding=UTF8 --lc-collate=C --lc-ctype=C"
+      # Keep the cluster in a subdirectory so the volume root stays free of lost+found.
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    command:
+      - postgres
+      # --- Connection capacity -------------------------------------------
+      # Comfortably above the app's Hikari ceiling (32) so migrations, psql
+      # sessions and a second app instance all still fit.
+      - -c
+      - max_connections=200
+      # --- Memory ---------------------------------------------------------
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      # --- Durability: non-negotiable for a ledger ------------------------
+      # synchronous_commit=on means a committed transfer survives an immediate
+      # crash. Never relax this to speed up benchmarks.
+      - -c
+      - synchronous_commit=on
+      - -c
+      - fsync=on
+      - -c
+      - full_page_writes=on
+      # --- WAL ------------------------------------------------------------
+      # logical decoding lets a Debezium/outbox reader tail committed entries
+      # without polling the journal table.
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - wal_compression=on
+      - -c
+      - min_wal_size=128MB
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - checkpoint_completion_target=0.9
+      # --- Concurrency control -------------------------------------------
+      # track_commit_timestamp gives every commit an authoritative server-side
+      # timestamp, used to order entries independently of application clocks.
+      - -c
+      - track_commit_timestamp=on
+      # Report deadlocks quickly: contended transfers should fail fast and retry
+      # rather than sit blocked behind a lock cycle.
+      - -c
+      - deadlock_timeout=200ms
+      - -c
+      - log_lock_waits=on
+      # A transaction holding ledger row locks must never idle indefinitely.
+      - -c
+      - idle_in_transaction_session_timeout=60s
+      # --- Planner / IO for SSD-backed volumes ---------------------------
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - default_statistics_target=200
+      # --- Observability --------------------------------------------------
+      - -c
+      - log_min_duration_statement=250ms
+      - -c
+      - log_checkpoints=on
+      - -c
+      - log_autovacuum_min_duration=0
+      - -c
+      - log_temp_files=0
+      - -c
+      - log_connections=off
+      - -c
+      - log_disconnections=off
+      - -c
+      - log_line_prefix=%m [%p] %q%u@%d/%a
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.max=10000
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - timezone=UTC
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+    healthcheck:
+      # -h 127.0.0.1 forces a real TCP handshake. Without it pg_isready probes the
+      # unix socket, which reports ready during the initdb bootstrap phase while
+      # the TCP listener is still closed.
+      test: ["CMD-SHELL", "pg_isready -U apex -d apex_ledger -h 127.0.0.1 -p 5432"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+    networks:
+      - apex-ledger
+
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  # =========================================================================
+  # Redis 7 — idempotency, distributed leases, balance snapshots
+  # =========================================================================
+  redis:
+    image: redis:7.4.10-alpine
+    container_name: apex-ledger-redis
+    restart: unless-stopped
+    stop_grace_period: 15s
+
+    command:
+      - redis-server
+      # --- Durability -----------------------------------------------------
+      # AOF with everysec fsync. Idempotency keys must survive a restart: losing
+      # them turns a client retry into a duplicate posting.
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --auto-aof-rewrite-percentage
+      - "100"
+      - --auto-aof-rewrite-min-size
+      - 64mb
+      # RDB snapshots as a secondary recovery path.
+      - --save
+      - 900 1
+      - --save
+      - 300 10
+      - --save
+      - 60 10000
+      # Refuse writes rather than serve stale data if the disk fails.
+      - --stop-writes-on-bgsave-error
+      - "yes"
+      # --- Memory ---------------------------------------------------------
+      # noeviction is a correctness requirement, not a tuning choice. Under an
+      # LRU policy Redis would silently drop an idempotency key or an in-flight
+      # transfer lease, which is exactly how a double-spend gets through. We
+      # would rather take a hard OOM error on write and shed load.
+      - --maxmemory
+      - 512mb
+      - --maxmemory-policy
+      - noeviction
+      # --- Latency / connections -----------------------------------------
+      - --timeout
+      - "0"
+      - --tcp-keepalive
+      - "60"
+      - --tcp-backlog
+      - "511"
+      - --maxclients
+      - "10000"
+      # Surface anything slower than 10ms; lease acquisition sits on the hot path.
+      - --slowlog-log-slower-than
+      - "10000"
+      - --slowlog-max-len
+      - "1024"
+      # Lazy deletion keeps expiring idempotency keys off the command thread.
+      - --lazyfree-lazy-expire
+      - "yes"
+      - --lazyfree-lazy-eviction
+      - "yes"
+      - --lazyfree-lazy-server-del
+      - "yes"
+      # Keyspace notifications for expired lease observability (Ex = expired events).
+      - --notify-keyspace-events
+      - Ex
+      - --loglevel
+      - notice
+
+    ports:
+      - "6379:6379"
+
+    volumes:
+      - redis-data:/data
+
+    healthcheck:
+      # Match on PONG explicitly: redis-cli exits 0 even while the server is still
+      # loading the AOF into memory, when it answers -LOADING to real commands.
+      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -p 6379 ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+
+    networks:
+      - apex-ledger
+
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  # =========================================================================
+  # Apache Kafka 4.1 — KRaft mode, single combined broker+controller node
+  #
+  # Kafka 4.x removed ZooKeeper entirely, so KRaft is the only mode available.
+  # This node runs process.roles=broker,controller.
+  # =========================================================================
+  kafka:
+    image: apache/kafka:4.1.2
+    container_name: apex-ledger-kafka
+    restart: unless-stopped
+    # Controlled shutdown must finish flushing before SIGKILL.
+    stop_grace_period: 60s
+
+    environment:
+      # --- KRaft identity -------------------------------------------------
+      # CLUSTER_ID is 16 bytes, base64url-encoded and unpadded (exactly 22 chars).
+      # The entrypoint runs `kafka-storage.sh format` with it on first boot; it is
+      # then written into the log dir's meta.properties. Changing it after the
+      # volume exists makes the broker refuse to start with an InconsistentClusterId
+      # error, so it is pinned rather than generated.
+      CLUSTER_ID: f5wrpOiPTEuaLW8eXTuKcA
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+
+      # --- Listeners ------------------------------------------------------
+      # Two data listeners are required because the advertised host differs by
+      # caller. Containers on the apex-ledger network resolve `kafka`; processes
+      # on the host resolve `localhost`. A single listener cannot advertise both,
+      # and advertising only one breaks the other after the initial metadata
+      # fetch redirects the client to the advertised address.
+      #
+      #   INTERNAL 19092 -> other containers          (advertised as kafka:19092)
+      #   EXTERNAL  9092 -> host / IDE / app JVM      (advertised as localhost:9092)
+      #   CONTROLLER 9093 -> KRaft quorum, never for clients
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:19092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # --- Storage --------------------------------------------------------
+      # The image's default log.dirs is /tmp/kraft-combined-logs, which is wiped
+      # on container recreation. /var/lib/kafka/data is created in the image and
+      # owned by appuser, so the named volume below inherits writable ownership.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+
+      # --- Single-node replication factors --------------------------------
+      # Every internal topic must be RF=1; the defaults of 3 leave the broker
+      # unable to create __consumer_offsets and it fails on first consumer join.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+
+      # --- Topic defaults --------------------------------------------------
+      # 12 partitions gives room to scale consumer concurrency; ordering is
+      # preserved per key, and the producer keys on account id so all entries
+      # touching one account stay on one partition and stay strictly ordered.
+      KAFKA_NUM_PARTITIONS: 12
+      # Off deliberately: a typo in a topic name must fail loudly instead of
+      # quietly creating a new topic. Real topics are declared as NewTopic beans.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # -1 disables time-based retention. The ledger event log is an audit record
+      # and is never aged out; compaction is applied per topic where appropriate.
+      KAFKA_LOG_RETENTION_HOURS: -1
+      KAFKA_LOG_SEGMENT_BYTES: 268435456
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
+      # Keep whatever codec the producer used instead of recompressing on the broker.
+      KAFKA_COMPRESSION_TYPE: producer
+
+      # --- Threading / rebalance ------------------------------------------
+      KAFKA_NUM_NETWORK_THREADS: 4
+      KAFKA_NUM_IO_THREADS: 8
+      KAFKA_NUM_REPLICA_FETCHERS: 2
+      # No delay locally: a single consumer should join and start polling at once.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # --- JVM -------------------------------------------------------------
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx1g
+      KAFKA_JVM_PERFORMANCE_OPTS: -XX:+UseG1GC -XX:MaxGCPauseMillis=20 -XX:InitiatingHeapOccupancyPercent=35
+
+    ports:
+      # Only the EXTERNAL listener is published. 19092 stays network-internal and
+      # 9093 is the controller quorum, which no client should ever reach.
+      - "9092:9092"
+
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+
+    healthcheck:
+      # A TCP port check passes before the broker has finished KRaft recovery and
+      # can serve metadata. Listing topics forces a real API round trip, so the
+      # container only reports healthy once it can actually accept clients.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      # Generous: first boot formats the KRaft storage directory before listening.
+      start_period: 45s
+
+    networks:
+      - apex-ledger
+
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+# ===========================================================================
+# Named volumes — all ledger state lives here. `docker compose down -v` is
+# destructive and must never be run against anything but a local machine.
+# ===========================================================================
+volumes:
+  postgres-data:
+    name: apex-ledger-postgres-data
+  redis-data:
+    name: apex-ledger-redis-data
+  kafka-data:
+    name: apex-ledger-kafka-data
+
+networks:
+  apex-ledger:
+    name: apex-ledger
+    driver: bridge

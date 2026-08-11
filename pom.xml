@@ -1,0 +1,367 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+      ApexLedger inherits from spring-boot-starter-parent, which supplies:
+        * the spring-boot-dependencies BOM (every version below is managed there),
+        * UTF-8 source/resource encoding,
+        * the `-parameters` javac flag required for Spring's parameter-name discovery,
+        * plugin management for compiler / surefire / failsafe / jar / resources.
+    -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.16</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.apex</groupId>
+    <artifactId>apex-ledger</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>ApexLedger</name>
+    <description>
+        Highly concurrent, multi-currency, immutable double-entry ledger engine built on
+        Spring Boot 3.5, Java 21 virtual threads, Spring GraphQL, PostgreSQL, Redis and Kafka.
+    </description>
+
+    <properties>
+        <!-- Toolchain. Virtual threads (JEP 444) are a final feature in 21, so no preview flags. -->
+        <java.version>21</java.version>
+        <maven.compiler.release>21</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+        <!--
+          Pinned explicitly so the Testcontainers generation is a deliberate, reviewable
+          decision rather than a side effect of a Spring Boot patch bump. This matches the
+          version spring-boot-dependencies:3.5.16 manages, so nothing is downgraded.
+        -->
+        <testcontainers.version>1.21.4</testcontainers.version>
+
+        <!-- Integration tests are the *IT classes driven by failsafe; unit tests are *Test / *Tests. -->
+        <skipITs>false</skipITs>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!--
+              Importing the Testcontainers BOM aligns every module (postgresql, kafka,
+              junit-jupiter) on ${testcontainers.version}. Imported BOMs in this POM take
+              precedence over the inherited spring-boot-dependencies entries.
+            -->
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${testcontainers.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+
+        <!-- ============================================================== -->
+        <!-- Web transport                                                  -->
+        <!-- ============================================================== -->
+
+        <!--
+          Required by spring-boot-starter-graphql: Spring GraphQL needs a servlet (or
+          reactive) transport to expose /graphql. Embedded Tomcat is what switches over to
+          a virtual-thread-per-request executor when spring.threads.virtual.enabled=true.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-graphql</artifactId>
+        </dependency>
+
+        <!-- Bean Validation (Hibernate Validator) for GraphQL @Argument payload constraints. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <!-- ============================================================== -->
+        <!-- Persistence: PostgreSQL is the ledger's system of record       -->
+        <!-- ============================================================== -->
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!--
+          Schema is owned by versioned migrations, never by hibernate.ddl-auto. An append-only
+          ledger cannot tolerate an ORM mutating live DDL, so ddl-auto stays on `validate`.
+        -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+
+        <!--
+          Flyway 10+ moved per-engine support into separate modules; flyway-core alone cannot
+          resolve a PostgreSQL JDBC URL and fails at startup with "Unsupported Database".
+        -->
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-database-postgresql</artifactId>
+        </dependency>
+
+        <!-- ============================================================== -->
+        <!-- Redis: idempotency keys, distributed leases, balance snapshots -->
+        <!-- ============================================================== -->
+
+        <!-- Lettuce is the default (and only) client shipped by this starter. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+
+        <!--
+          Mandatory for connection pooling. Spring Boot only builds a pooling
+          LettuceConnectionFactory when commons-pool2 is on the classpath; without it every
+          `spring.data.redis.lettuce.pool.*` value in application.yml is silently ignored and
+          all traffic shares a single shared connection.
+        -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-pool2</artifactId>
+        </dependency>
+
+        <!-- ============================================================== -->
+        <!-- Kafka: immutable, append-only event log of posted entries      -->
+        <!-- ============================================================== -->
+
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
+
+        <!-- ============================================================== -->
+        <!-- Observability                                                  -->
+        <!-- ============================================================== -->
+
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!--
+          Bridges Micrometer Observation to Brave/W3C trace context so a GraphQL mutation,
+          its JDBC transaction and the resulting Kafka record share one trace id.
+        -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-tracing-bridge-brave</artifactId>
+        </dependency>
+
+        <!-- ============================================================== -->
+        <!-- Build-time only                                                -->
+        <!-- ============================================================== -->
+
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Generates IDE metadata for the @ConfigurationProperties types under `apex.*`. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-configuration-processor</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!--
+          Auto-starts docker-compose.yml on `bootRun`-style local launches. Inert unless
+          spring.docker-compose.enabled=true, and always skipped inside tests.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-docker-compose</artifactId>
+            <scope>runtime</scope>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- ============================================================== -->
+        <!-- Test scope                                                     -->
+        <!-- ============================================================== -->
+
+        <!-- JUnit 5, AssertJ, Mockito, Hamcrest, JSONassert, JsonPath, spring-test. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- GraphQlTester: document-driven assertions against the schema and controllers. -->
+        <dependency>
+            <groupId>org.springframework.graphql</groupId>
+            <artifactId>spring-graphql-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- EmbeddedKafkaBroker plus Kafka-specific test utilities. -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!--
+          Supplies @ServiceConnection, which derives spring.datasource.*, spring.data.redis.*
+          and spring.kafka.bootstrap-servers straight from running containers. This removes
+          every hand-written @DynamicPropertySource block.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Testcontainers PostgreSQL module (requested). -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Testcontainers Kafka module (requested); KafkaContainer runs in KRaft mode. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!--
+          Concurrency assertions need a polling primitive: the double-spend suite fires N
+          concurrent transfers and must wait for eventual balance convergence without
+          Thread.sleep-based flakiness.
+        -->
+        <dependency>
+            <groupId>org.awaitility</groupId>
+            <artifactId>awaitility</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+    </dependencies>
+
+    <build>
+        <plugins>
+
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <!-- Lombok is compile-time only; keep it out of the runnable fat jar. -->
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                        <exclude>
+                            <groupId>org.springframework.boot</groupId>
+                            <artifactId>spring-boot-configuration-processor</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                    <compilerArgs>
+                        <!-- Retain parameter names for Spring GraphQL @Argument binding. -->
+                        <arg>-parameters</arg>
+                        <arg>-Xlint:all,-processing,-serial</arg>
+                    </compilerArgs>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>${lombok.version}</version>
+                        </path>
+                        <path>
+                            <groupId>org.springframework.boot</groupId>
+                            <artifactId>spring-boot-configuration-processor</artifactId>
+                            <version>${project.parent.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+
+            <!-- Fast unit tests only; anything needing Docker is excluded here. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>**/*IT.java</exclude>
+                    </excludes>
+                    <!-- Deterministic time zone: ledger timestamps are asserted in UTC. -->
+                    <argLine>-Duser.timezone=UTC -Dfile.encoding=UTF-8</argLine>
+                </configuration>
+            </plugin>
+
+            <!--
+              Testcontainers-backed integration tests, so `mvn verify` exercises the real
+              PostgreSQL / Redis / Kafka stack.
+
+              No <executions> block here on purpose: spring-boot-starter-parent already
+              binds failsafe's integration-test and verify goals. Declaring another
+              execution makes both run and every IT execute twice.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <configuration>
+                    <includes>
+                        <include>**/*IT.java</include>
+                    </includes>
+                    <skipITs>${skipITs}</skipITs>
+                    <argLine>-Duser.timezone=UTC -Dfile.encoding=UTF-8</argLine>
+                </configuration>
+            </plugin>
+
+        </plugins>
+    </build>
+
+</project>

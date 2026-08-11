@@ -1,0 +1,95 @@
+# ===========================================================================
+# Test-profile overrides.
+#
+# Deliberately contains NO host, port or credential for PostgreSQL, Redis or
+# Kafka. Those are contributed at runtime by Testcontainers through
+# @ServiceConnection on the container beans in
+# src/test/java/com/apex/ledger/support/. Hard-coding them here is what causes
+# a suite to silently pass against a developer's local database.
+#
+# Activated with @ActiveProfiles("test").
+# ===========================================================================
+
+spring:
+
+  # Exercise the same threading model as production: a concurrency suite that
+  # runs on platform threads is not testing the deployed configuration.
+  threads:
+    virtual:
+      enabled: true
+
+  # Testcontainers owns container lifecycle here. spring.docker.compose.skip
+  # .in-tests already handles this; set explicitly so the intent survives a
+  # future change to the base file.
+  docker:
+    compose:
+      enabled: false
+
+  datasource:
+    hikari:
+      # Smaller than production but >1 on purpose: the double-spend suite needs
+      # genuinely concurrent connections to produce real lock contention.
+      maximum-pool-size: 16
+      minimum-idle: 2
+      connection-timeout: 5000
+      # Container startup is slower than a warm pool; do not flag it as a leak.
+      leak-detection-threshold: 0
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        # Surface N+1s and unbatched writes while the suite is cheap to run.
+        generate_statistics: true
+
+  flyway:
+    enabled: true
+    # Still disabled in tests. Isolation comes from container lifecycle, not
+    # from cleaning a shared schema — keeping this true means no test can ever
+    # be pointed at a real database and drop it.
+    clean-disabled: true
+
+  data:
+    redis:
+      # Fail fast so a misconfigured container surfaces as an error, not a hang.
+      timeout: 5s
+      connect-timeout: 5s
+      lettuce:
+        pool:
+          enabled: true
+          max-active: 32
+          min-idle: 2
+
+  kafka:
+    consumer:
+      group-id: apex-ledger-test
+      auto-offset-reset: earliest
+    listener:
+      concurrency: 2
+      # A test topic may legitimately not exist yet when the context starts.
+      missing-topics-fatal: false
+    admin:
+      auto-create: true
+      fail-fast: true
+
+  graphql:
+    graphiql:
+      enabled: false
+    schema:
+      inspection:
+        # Fail loudly in CI on any schema field without a controller mapping.
+        enabled: true
+
+# Keep container and client noise out of test output; keep our own at DEBUG.
+logging:
+  level:
+    root: WARN
+    com.apex.ledger: DEBUG
+    org.springframework.test: INFO
+    org.testcontainers: INFO
+    com.github.dockerjava: WARN
+    org.apache.kafka: WARN
+    org.apache.kafka.clients.NetworkClient: ERROR
+    org.hibernate.SQL: INFO

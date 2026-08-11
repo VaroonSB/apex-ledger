@@ -1,0 +1,527 @@
+# ===========================================================================
+# ApexLedger — base configuration
+#
+# Every external endpoint is overridable by environment variable and defaults to
+# the port published by docker-compose.yml, so a developer can clone, run
+# `docker compose up -d`, and start the app with no extra configuration.
+#
+# Money handling note: BigDecimal is the only accepted numeric carrier for
+# amounts. The Jackson block below enforces that on the wire in both directions.
+# ===========================================================================
+
+spring:
+
+  application:
+    name: apex-ledger
+
+  # =========================================================================
+  # Java 21 virtual threads
+  #
+  # This single switch moves request handling and message listeners off pooled
+  # platform threads:
+  #   * Tomcat serves each request on a fresh virtual thread, so
+  #     `server.tomcat.threads.max` no longer bounds concurrency and is
+  #     deliberately left unset below.
+  #   * Spring Kafka listener containers, @Async and task scheduling all get
+  #     virtual-thread SimpleAsyncTaskExecutors.
+  #
+  # Consequence for this service: the HTTP tier stops being the bottleneck and
+  # the JDBC pool becomes the admission-control point. That is intentional —
+  # unbounded virtual threads queueing on a bounded pool is exactly the
+  # backpressure a ledger wants, because it caps concurrent row-lock holders
+  # instead of letting 10k threads pile onto contended account rows.
+  #
+  # Caveat worth tracking: on Java 21 a `synchronized` block that blocks pins
+  # its carrier thread (JEP 491 only removed this in Java 24), and pgjdbc still
+  # synchronizes internally. Keep the carrier pool (jdk.virtualThreadScheduler
+  # .parallelism) at least as large as the JDBC pool so pinning cannot starve
+  # the scheduler.
+  # =========================================================================
+  threads:
+    virtual:
+      enabled: true
+
+  # Graceful shutdown: drain in-flight postings before the JVM exits, so a
+  # rolling deploy cannot abandon a half-committed transfer.
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+  # =========================================================================
+  # Local infrastructure lifecycle
+  #
+  # Off by default so CI and production never try to shell out to Docker.
+  # Enable for local work with: --spring.docker-compose.enabled=true
+  # =========================================================================
+  docker:
+    compose:
+      enabled: false
+      file: ./docker-compose.yml
+      # Start the stack but never tear it down on app shutdown, so restarting the
+      # app does not wipe local ledger data.
+      lifecycle-management: start-only
+      readiness:
+        wait: always
+        # Kafka formats its KRaft storage dir on first boot; allow for that.
+        timeout: 3m
+      skip:
+        in-tests: true
+
+  # =========================================================================
+  # Transaction semantics
+  # =========================================================================
+  transaction:
+    # A posting that cannot finish in 10s is contending pathologically; fail it
+    # and let the caller retry rather than hold account row locks open.
+    default-timeout: 10s
+    rollback-on-commit-failure: true
+
+  # =========================================================================
+  # PostgreSQL — system of record
+  # =========================================================================
+  datasource:
+    url: jdbc:postgresql://${APEX_DB_HOST:localhost}:${APEX_DB_PORT:5432}/${APEX_DB_NAME:apex_ledger}
+    username: ${APEX_DB_USERNAME:apex}
+    password: ${APEX_DB_PASSWORD:apex_local_dev}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: apex-ledger-hikari
+
+      # ---------------------------------------------------------------------
+      # Sizing. Under virtual threads this is the service's true concurrency
+      # limit, so it is sized against the database, not against thread count:
+      # keep it comfortably under postgres max_connections (200 in compose)
+      # with headroom for migrations, replicas and operator sessions.
+      # ---------------------------------------------------------------------
+      maximum-pool-size: 32
+      minimum-idle: 10
+
+      # Fail fast. A 3s wait for a connection surfaces saturation as a clean
+      # 503 instead of letting virtual threads queue without bound.
+      connection-timeout: 3000
+      validation-timeout: 2000
+
+      # Recycle well inside any proxy/database idle timeout.
+      idle-timeout: 300000
+      max-lifetime: 900000
+      keepalive-time: 120000
+
+      # Any connection held >15s indicates a leaked transaction. Logged, not fatal.
+      leak-detection-threshold: 15000
+
+      # ---------------------------------------------------------------------
+      # auto-commit=false pairs with
+      # hibernate.connection.provider_disables_autocommit=true below. Together
+      # they let Hibernate defer physical connection acquisition until the first
+      # statement, which shortens how long each transfer holds a pooled
+      # connection and therefore how long it holds its row locks.
+      # ---------------------------------------------------------------------
+      auto-commit: false
+
+      # READ COMMITTED is PostgreSQL's default and is correct here: the
+      # double-spend guard is explicit pessimistic locking (SELECT ... FOR UPDATE
+      # / advisory locks) on the account rows being debited, not a global
+      # isolation escalation. Raising this to SERIALIZABLE would trade targeted
+      # contention for cluster-wide serialization failures.
+      transaction-isolation: TRANSACTION_READ_COMMITTED
+
+      register-mbeans: true
+
+      data-source-properties:
+        # Tags every session in pg_stat_activity, so a contended lock can be
+        # traced back to this service.
+        ApplicationName: apex-ledger
+        assumeMinServerVersion: "16.0"
+        # Rewrites batched INSERTs into multi-row VALUES; the journal is written
+        # in batches of postings, so this is a direct win on the hot path.
+        reWriteBatchedInserts: true
+        prepareThreshold: 3
+        preparedStatementCacheQueries: 256
+        preparedStatementCacheSizeMiB: 16
+        tcpKeepAlive: true
+        # Seconds. Above the 10s transaction timeout so a slow query is cancelled
+        # by the timeout with a clean rollback rather than a socket teardown,
+        # while still bounding a truly hung connection.
+        socketTimeout: 60
+        connectTimeout: 5
+        loginTimeout: 5
+
+  # =========================================================================
+  # JPA / Hibernate
+  # =========================================================================
+  jpa:
+    # Never leave a session open across view rendering: it hides lazy loads
+    # outside the transaction and holds a connection for the whole request.
+    open-in-view: false
+    # Flyway owns DDL. `validate` asserts entities match the migrated schema and
+    # refuses to boot on drift — the only safe setting for an append-only ledger.
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        # Batch the postings of a journal entry into one round trip. Ordering
+        # inserts/updates is what makes JDBC batching actually group statements.
+        jdbc:
+          batch_size: 50
+          fetch_size: 128
+          time_zone: UTC
+        order_inserts: true
+        order_updates: true
+        batch_versioned_data: true
+        connection:
+          provider_disables_autocommit: true
+        query:
+          in_clause_parameter_padding: true
+          # Turns a silent in-memory pagination of a fetch-joined collection —
+          # which would quietly read the whole journal — into an exception.
+          fail_on_pagination_over_collection_fetch: true
+          plan_cache_max_size: 4096
+          plan_parameter_metadata_max_size: 256
+        # Micrometer/statistics off by default; enabled per-environment when
+        # profiling, since it adds contention of its own.
+        generate_statistics: false
+        session:
+          events:
+            log:
+              LOG_QUERIES_SLOWER_THAN_MS: 250
+        format_sql: false
+        highlight_sql: false
+
+  # =========================================================================
+  # Flyway — versioned, immutable schema history
+  # =========================================================================
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    table: apex_schema_history
+    schemas: public
+    default-schema: public
+    baseline-on-migrate: false
+    validate-on-migrate: true
+    # `clean` would drop the ledger. Disabled unconditionally, in every profile.
+    clean-disabled: true
+    # Applied migrations are immutable; a checksum change must fail the boot.
+    out-of-order: false
+    fail-on-missing-locations: true
+    placeholder-replacement: false
+
+  # =========================================================================
+  # Redis — idempotency keys, distributed transfer leases, balance snapshots
+  # =========================================================================
+  data:
+    redis:
+      host: ${APEX_REDIS_HOST:localhost}
+      port: ${APEX_REDIS_PORT:6379}
+      username: ${APEX_REDIS_USERNAME:}
+      password: ${APEX_REDIS_PASSWORD:}
+      database: 0
+      client-type: lettuce
+      client-name: apex-ledger
+      # Lease acquisition is on the critical path of every transfer: a slow
+      # Redis must fail fast so the posting aborts instead of stalling.
+      timeout: 2s
+      connect-timeout: 2s
+      ssl:
+        enabled: false
+      lettuce:
+        shutdown-timeout: 200ms
+        # Requires org.apache.commons:commons-pool2 on the classpath, which the
+        # POM declares explicitly. Without it Boot builds a non-pooling factory
+        # and every value below is silently ignored.
+        pool:
+          enabled: true
+          max-active: 64
+          max-idle: 32
+          min-idle: 8
+          # Bounded borrow wait; -1 would block a virtual thread indefinitely.
+          max-wait: 1s
+          time-between-eviction-runs: 30s
+
+  # =========================================================================
+  # Kafka — immutable outbound event log
+  # =========================================================================
+  kafka:
+    bootstrap-servers: ${APEX_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    client-id: apex-ledger
+
+    # Shared by producer, consumer and admin clients.
+    properties:
+      security.protocol: PLAINTEXT
+      metadata.max.age.ms: 120000
+      reconnect.backoff.ms: 100
+      reconnect.backoff.max.ms: 10000
+      retry.backoff.ms: 200
+
+    producer:
+      client-id: apex-ledger-producer
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # -------------------------------------------------------------------
+      # Durability over latency, without exception. A journal entry that is
+      # acknowledged to the client and then lost from the event log leaves
+      # downstream projections permanently divergent from the ledger.
+      # -------------------------------------------------------------------
+      acks: all
+      retries: 2147483647
+      batch-size: 32768
+      buffer-memory: 67108864
+      compression-type: zstd
+      properties:
+        # Exactly-once *per partition*: dedupes broker-side retries so the
+        # retry storm above cannot append an entry twice.
+        enable.idempotence: true
+        # 5 is the maximum the idempotent producer allows while still
+        # guaranteeing ordering; anything higher disables the ordering promise.
+        max.in.flight.requests.per.connection: 5
+        linger.ms: 5
+        request.timeout.ms: 30000
+        delivery.timeout.ms: 120000
+        # Bounded blocking on a full buffer or missing metadata, so a Kafka
+        # outage cannot wedge the request thread holding a DB transaction.
+        max.block.ms: 5000
+        # Type headers would couple consumers to our class names; the schema is
+        # the contract, so consumers deserialize against their own types.
+        spring.json.add.type.headers: false
+
+    consumer:
+      client-id: apex-ledger-consumer
+      group-id: apex-ledger
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # ErrorHandlingDeserializer wraps the real deserializer so a poison record
+      # surfaces as a handleable failure instead of an infinite poll loop.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      # Offsets are committed by the container after the listener succeeds
+      # (ack-mode below), never on a timer. Auto-commit would acknowledge
+      # records the ledger has not yet durably processed.
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+      # Skip records from aborted transactions.
+      isolation-level: read-committed
+      max-poll-records: 250
+      fetch-min-size: 1B
+      fetch-max-wait: 100ms
+      properties:
+        spring.deserializer.key.delegate.class: org.apache.kafka.common.serialization.StringDeserializer
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        # Deserialization allow-list. Never widen this to "*": it would let a
+        # record on the wire name an arbitrary class to instantiate.
+        spring.json.trusted.packages: com.apex.ledger.domain.event
+        spring.json.use.type.headers: false
+        max.poll.interval.ms: 300000
+        session.timeout.ms: 45000
+        heartbeat.interval.ms: 3000
+        # Cooperative rebalancing: partitions are not all revoked on a member
+        # change, so a deploy does not stop the whole projection pipeline.
+        partition.assignment.strategy: org.apache.kafka.clients.consumer.CooperativeStickyAssignor
+
+    listener:
+      # Commit the offset immediately after the listener returns normally.
+      ack-mode: manual_immediate
+      # Runs on virtual threads via spring.threads.virtual.enabled. Keep at or
+      # below the partition count (12 in compose) — extra consumers idle.
+      concurrency: 6
+      poll-timeout: 1s
+      # Topics are created by NewTopic beans; a missing topic at startup should
+      # log and retry, not abort the whole application context.
+      missing-topics-fatal: false
+      observation-enabled: true
+      type: single
+
+    admin:
+      client-id: apex-ledger-admin
+      # Creates topics declared as NewTopic beans — needed because the broker
+      # has auto.create.topics.enable=false.
+      auto-create: true
+      # Do not block startup on broker availability; the app stays useful for
+      # reads while Kafka recovers.
+      fail-fast: false
+      modify-topic-configs: false
+
+  # =========================================================================
+  # GraphQL — the only public API surface
+  # =========================================================================
+  graphql:
+    schema:
+      locations: classpath:graphql/**/
+      file-extensions: .graphqls,.gqls
+      inspection:
+        # Reports schema fields with no corresponding controller mapping (and the
+        # reverse) at startup, which catches resolver drift before traffic does.
+        enabled: true
+      printer:
+        enabled: false
+    http:
+      path: /graphql
+    websocket:
+      path: /graphql-ws
+      connection-init-timeout: 60s
+      keep-alive: 30s
+    graphiql:
+      # Local developer console. Disable in any deployed environment.
+      enabled: true
+      path: /graphiql
+
+  # =========================================================================
+  # JSON — monetary precision on the wire
+  # =========================================================================
+  jackson:
+    default-property-inclusion: non_null
+    time-zone: UTC
+    locale: en_US
+    serialization:
+      # ISO-8601 strings, not epoch millis: audit records must stay readable.
+      write-dates-as-timestamps: false
+      # Emit 1000000.00, never 1.0E+6. Scientific notation silently loses the
+      # scale that encodes a currency's minor units.
+      write-bigdecimal-as-plain: true
+      fail-on-empty-beans: false
+    deserialization:
+      # Parse every JSON floating point literal as BigDecimal. Without this,
+      # Jackson binds to double first and an amount can be corrupted before
+      # validation ever sees it.
+      use-big-decimal-for-floats: true
+      fail-on-unknown-properties: false
+      fail-on-null-for-primitives: true
+
+# ===========================================================================
+# HTTP server
+# ===========================================================================
+server:
+  port: ${APEX_SERVER_PORT:8080}
+  shutdown: graceful
+  http2:
+    enabled: true
+  compression:
+    enabled: true
+    mime-types: application/json,application/graphql-response+json
+    min-response-size: 2KB
+  # Never leak internals through the error contract; GraphQL errors are shaped
+  # by a DataFetcherExceptionResolver instead.
+  error:
+    include-message: never
+    include-stacktrace: never
+    include-binding-errors: never
+    whitelabel:
+      enabled: false
+  tomcat:
+    # NOTE: server.tomcat.threads.max is intentionally absent. With virtual
+    # threads enabled Tomcat uses a virtual-thread executor and ignores it;
+    # setting it would imply a limit that does not exist. Admission control is
+    # the Hikari pool above.
+    max-connections: 20000
+    accept-count: 200
+    connection-timeout: 20s
+    keep-alive-timeout: 30s
+    max-keep-alive-requests: 200
+    max-http-form-post-size: 256KB
+    max-swallow-size: 2MB
+    mbeanregistry:
+      enabled: true
+    remoteip:
+      remote-ip-header: X-Forwarded-For
+      protocol-header: X-Forwarded-Proto
+
+# ===========================================================================
+# Actuator / Micrometer
+# ===========================================================================
+management:
+  endpoints:
+    web:
+      base-path: /actuator
+      exposure:
+        include: health,info,metrics,prometheus,loggers,threaddump
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
+      group:
+        # Liveness must not depend on infrastructure: a Redis blip should not
+        # get the pod killed and restarted, only pulled from the load balancer.
+        liveness:
+          include: ping
+        readiness:
+          include: db,redis,ping
+    prometheus:
+      access: read-only
+  health:
+    db:
+      enabled: true
+    redis:
+      enabled: true
+    diskspace:
+      enabled: true
+  metrics:
+    tags:
+      application: apex-ledger
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        spring.data.repository.invocations: true
+      slo:
+        http.server.requests: 25ms,50ms,100ms,250ms,500ms,1s
+  observations:
+    key-values:
+      application: apex-ledger
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+  info:
+    env:
+      enabled: true
+    java:
+      enabled: true
+    os:
+      enabled: true
+
+# ===========================================================================
+# Logging
+# ===========================================================================
+logging:
+  level:
+    root: INFO
+    com.apex.ledger: DEBUG
+    org.springframework.graphql: INFO
+    org.springframework.kafka: INFO
+    org.apache.kafka: WARN
+    # Flip these two to DEBUG/TRACE to inspect generated SQL and bound
+    # parameters. Left off here: parameter logging prints account identifiers
+    # and amounts, which do not belong in application logs.
+    org.hibernate.SQL: INFO
+    org.hibernate.orm.jdbc.bind: INFO
+    com.zaxxer.hikari.HikariConfig: INFO
+  pattern:
+    correlation: "[${spring.application.name:apex-ledger},%X{traceId:-},%X{spanId:-}] "
+
+# ===========================================================================
+# Application-specific configuration
+#
+# Declared here so the topic names and TTLs stay in one place alongside the
+# infrastructure they depend on. These keys are bound to @ConfigurationProperties
+# types in Phase 2; until then Spring ignores them harmlessly.
+# ===========================================================================
+apex:
+  ledger:
+    # Reporting currency for consolidated positions. Individual accounts carry
+    # their own ISO-4217 currency; no implicit cross-currency conversion is ever
+    # performed during a posting.
+    base-currency: USD
+    idempotency:
+      key-prefix: "apex:idem:"
+      # Must exceed the longest plausible client retry window, otherwise an
+      # expired key turns a retry into a second posting.
+      ttl: 24h
+    locking:
+      # PostgreSQL transactional advisory locks: acquired inside the posting
+      # transaction and released by the database on commit or rollback, so a
+      # crashed node cannot leave an account permanently locked. Redis leases
+      # are used only for coarse-grained, non-authoritative guards.
+      key-prefix: "apex:lock:"
+      lease-time: 3s
+      wait-time: 1s
+    topics:
+      journal-entries: apex.ledger.journal-entries.v1
+      balance-projections: apex.ledger.balance-projections.v1
+      dead-letter: apex.ledger.dlq.v1

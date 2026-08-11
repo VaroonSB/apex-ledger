@@ -1,0 +1,27 @@
+"""
+ApexLedger GraphQL schema — root definition.
+
+Spring GraphQL fails fast at startup if no schema resource is found, so this file
+establishes the root Query type that the domain schema extends in Phase 2.
+
+Phase 2 adds, in separate .graphqls files picked up by the
+`classpath:graphql/**/` pattern:
+  * custom scalars (Decimal, DateTime, UUID, CurrencyCode) with their
+    RuntimeWiringConfigurer registrations,
+  * Account / JournalEntry / Posting / Balance types,
+  * the postTransfer mutation, carrying a client-supplied idempotency key.
+
+Every field added later must be resolved by a controller mapping:
+`spring.graphql.schema.inspection.enabled=true` reports unmapped fields at
+startup rather than returning nulls at request time.
+"""
+type Query {
+    """
+    Transport-level readiness probe. Confirms the GraphQL HTTP endpoint, the
+    schema and the controller wiring are all live, without touching PostgreSQL,
+    Redis or Kafka. Use /actuator/health for dependency health.
+
+    Returns the literal string "pong".
+    """
+    ping: String!
+}
