@@ -119,7 +119,9 @@ can still run the domain suite, and CI can fan the two out to different runners.
 
 | Concern | Owner | Mechanism |
 |---|---|---|
-| Double-spend / concurrent debit | `db/migration` — `trg_journal_entries_apply_balance` + `ck_accounts_minimum_balance` | The balance trigger's UPDATE row-locks the account, serialising concurrent postings; the CHECK then rejects an overdraft. Phase 3 adds advisory locks for deterministic multi-account lock **ordering**, not for the guarantee itself |
+| Double-spend / concurrent debit | `db/migration` — `trg_journal_entries_apply_balance` + `ck_accounts_minimum_balance` | The balance trigger's UPDATE row-locks the account, serialising concurrent postings; the CHECK then rejects an overdraft |
+| Wasted contention / deadlock | `infrastructure/concurrency/RedissonAccountLockManager` | Redisson lock over the account set, acquired in sorted id order with explicit wait + lease. Coordination and cache coherence only — never the correctness authority, since a lease can expire under its holder with no fencing token |
+| Stale cached balance | `infrastructure/cache/AccountBalanceCache` | Write-through under the account lock, plus a monotonic fence (`total_debits + total_credits`) compared in Lua so an out-of-order write is discarded; TTL bounds a lost write |
 | Duplicate client submission | `infrastructure/concurrency` (`DatabaseIdempotencyGuard`) | `uq_transactions_idempotency_key`. The key is on the `transactions` row, so the reservation is atomic with the postings. Redis `SET NX` is a Phase 3 fast path, never the authority |
 | Lost events | `infrastructure/messaging/producer` | transactional outbox written in the same DB transaction as the entry, then relayed to Kafka |
 | Immutability | `infrastructure/persistence` | insert-only entities, no `UPDATE`/`DELETE` grants on journal tables, `ddl-auto=validate` |

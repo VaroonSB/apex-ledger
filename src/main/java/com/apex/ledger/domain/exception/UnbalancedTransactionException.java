@@ -18,16 +18,28 @@ public final class UnbalancedTransactionException extends LedgerException {
     private final UUID transactionId;
 
     public UnbalancedTransactionException(UUID transactionId, String detail) {
-        super("transaction %s does not satisfy double-entry: %s".formatted(transactionId, detail));
+        super("%s does not satisfy double-entry: %s".formatted(describe(transactionId), detail));
         this.transactionId = transactionId;
     }
 
+    /**
+     * For the in-memory check that runs before anything is written, where no transaction id exists yet.
+     */
+    public static UnbalancedTransactionException beforePersisting(String detail) {
+        return new UnbalancedTransactionException(null, detail);
+    }
+
+    private static String describe(UUID transactionId) {
+        return transactionId == null ? "the submitted posting" : "transaction " + transactionId;
+    }
+
     public UnbalancedTransactionException(UUID transactionId, String detail, Throwable cause) {
-        super("transaction %s does not satisfy double-entry: %s".formatted(transactionId, detail),
+        super("%s does not satisfy double-entry: %s".formatted(describe(transactionId), detail),
                 cause);
         this.transactionId = transactionId;
     }
 
+    /** The offending transaction, or {@code null} when the check ran before anything was persisted. */
     public UUID transactionId() {
         return transactionId;
     }

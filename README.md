@@ -5,10 +5,10 @@ A production-grade, highly concurrent, multi-currency **double-entry ledger engi
 Spring Boot 3.5.16 · Java 21 (virtual threads) · Spring GraphQL · PostgreSQL 16 · Redis 7 · Apache
 Kafka 4 (KRaft)
 
-> **Status: Phase 2 complete — domain model, immutable schema and transactional outbox.** The build,
-> infrastructure plane, runtime configuration, ledger schema, JPA entities, repositories and
-> idempotency guard are all in place and verified against a real PostgreSQL 16. The GraphQL domain
-> schema, posting service and Kafka outbox relay arrive in Phase 3.
+> **Status: Phase 3 complete — concurrency engine, distributed locking and balance cache.** The
+> posting engine, Redisson account locking and the read-through/write-through balance cache are in
+> place and verified against a real PostgreSQL 16 and Redis 7. The GraphQL API and the Kafka outbox
+> relay arrive in Phase 4.
 
 ---
 
@@ -187,8 +187,51 @@ the usual "truncate between tests" strategy is impossible against those tables. 
 from a fresh Testcontainers database per run, and create their own accounts and unique idempotency
 keys. This is the immutability guarantee working as designed, not a gap.
 
-## Phase 3 (not yet implemented)
+## The posting pipeline
 
-GraphQL domain schema, custom scalars and typed error mapping · the transfer posting service with
-deterministic multi-account lock ordering · PostgreSQL advisory-lock adapter · Kafka outbox relay ·
-Redis balance projections and idempotency fast path · the double-spend concurrency suite.
+`LedgerEngineService.post` runs eight steps, and the order is the design:
+
+```
+1. validate double-entry            in memory — reject nonsense before spending a lock or a connection
+2. fingerprint the request          SHA-256 over a canonical, leg-sorted form
+3. idempotency fast path            a replay returns the original outcome without locking
+4. ACQUIRE DISTRIBUTED LOCK         sorted account set, explicit wait (2s) + lease (15s)
+5. @Transactional persist           transaction + journal entries + outbox event, one commit
+6. read committed balances          authoritative, post-commit
+7. write-through the balance cache  still holding the lock
+8. RELEASE LOCK                     try-with-resources, same thread that acquired
+```
+
+**Step 4 comes before step 5** deliberately. Opening the transaction first and *then* waiting on Redis
+would hold a pooled JDBC connection for the whole wait; under contention on one hot account that
+exhausts the 32-connection pool and takes down every account. Locks are always acquired outside the
+transaction.
+
+**Two locks, two jobs.** The Redisson lock is *coordination*, not correctness. A lease can expire while
+its holder is still working, after which another node legitimately acquires it — Redis cannot revoke a
+lease already granted, and there is no fencing token. What it buys is that N concurrent requests for one
+account do not all reach PostgreSQL, take row locks, do the work and then get all-but-one rejected;
+plus bounded, typed failure; plus cache coherence. Correctness stays where Phase 2 put it: the balance
+trigger's row lock and `ck_accounts_minimum_balance`.
+
+`RedissonConfig` refuses to start if `lease-time <= spring.transaction.default-timeout`, because a lease
+that can expire mid-transaction silently voids the mutual exclusion the engine believes it has.
+
+### Verified against real PostgreSQL 16 + Redis 7
+
+| Property | Result |
+|---|---|
+| Contended withdrawals serialise rather than fail | 8 concurrent withdrawals of a 100 balance → 1 success, 7 `InsufficientFunds`, **0 lock timeouts** |
+| Opposing transfers do not deadlock | 24 concurrent alternating A→B / B→A transfers → all succeed; total lock ordering by account id |
+| A lock held elsewhere times out cleanly | bounded by the 2s wait, typed `AccountLockTimeoutException`, retryable |
+| Concurrent submissions of one key | 8 racers → exactly 1 posting |
+| Leg order does not affect the fingerprint | reversed legs replay instead of conflicting |
+| Atomicity of the triple | transaction + 2 entries + 1 `PENDING` outbox row, or nothing |
+| Cache fence discards out-of-order writes | a stale-fence write is rejected; a newer one applies |
+| Lease expiry during posting | 0 occurrences |
+
+## Phase 4 (not yet implemented)
+
+GraphQL domain schema, custom scalars and typed error mapping · the Kafka outbox relay draining
+`outbox_events` with `SKIP LOCKED` · consumer-side balance projections · Redis `SET NX` idempotency
+fast path.
