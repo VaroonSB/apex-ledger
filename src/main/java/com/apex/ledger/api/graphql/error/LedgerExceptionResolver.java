@@ -10,6 +10,10 @@ import com.apex.ledger.domain.exception.ImmutableLedgerViolationException;
 import com.apex.ledger.domain.exception.InsufficientFundsException;
 import com.apex.ledger.domain.exception.LedgerException;
 import com.apex.ledger.domain.exception.UnbalancedTransactionException;
+import io.github.resilience4j.ratelimiter.RequestNotPermitted;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+
 import graphql.GraphQLError;
 import graphql.GraphqlErrorBuilder;
 import graphql.schema.DataFetchingEnvironment;
@@ -58,7 +62,21 @@ public class LedgerExceptionResolver extends DataFetcherExceptionResolverAdapter
 
     private static final Logger log = LoggerFactory.getLogger(LedgerExceptionResolver.class);
 
-    public LedgerExceptionResolver() {
+    /**
+     * Counts requests shed by the rate limiter.
+     *
+     * <p>Registered here because this is the only place a rejection is observable. Resilience4j
+     * publishes no rejection counter for a rate limiter, and a shed request never reaches the engine,
+     * so it never appears in {@code apex.ledger.posting.result} either. Without this meter, load
+     * shedding shows up only as a dip in a gauge between scrapes — which is to say, not at all.
+     */
+    private final Counter rateLimitedCounter;
+
+    public LedgerExceptionResolver(MeterRegistry meterRegistry) {
+        this.rateLimitedCounter = Counter.builder("apex.ledger.api.rate.limited")
+                .description("Postings refused by the rate limiter before reaching the engine. "
+                        + "Nothing was written; alert on a sustained non-zero rate.")
+                .register(meterRegistry);
         // Make the resolver's own mapping failures visible instead of silently degrading to a generic
         // internal error.
         setThreadLocalContextAware(false);
@@ -66,6 +84,23 @@ public class LedgerExceptionResolver extends DataFetcherExceptionResolverAdapter
 
     @Override
     protected GraphQLError resolveToSingleError(Throwable exception, DataFetchingEnvironment env) {
+
+        if (exception instanceof RequestNotPermitted rateLimited) {
+            // Admission control shed this request. Nothing was written and no idempotency key was
+            // consumed, so the same request — with the same key — can simply be retried.
+            //
+            // Logged at debug, not warn: during a spike this fires at the rate of the excess traffic,
+            // and a log line per rejection would turn shed load into a logging incident. The
+            // resilience4j.ratelimiter.calls counter is the signal to alert on.
+            rateLimitedCounter.increment();
+            log.debug("rate limiter rejected a posting: {}", rateLimited.getMessage());
+            Map<String, Object> extensions = extensions("RATE_LIMITED", true);
+            extensions.put("retryAfterMillis", 1_000L);
+            return error(exception, env, ErrorType.INTERNAL_ERROR,
+                    "The ledger is shedding load to protect the posting engine. Nothing was written; "
+                            + "retry with backoff using the same idempotency key.",
+                    extensions);
+        }
 
         if (exception instanceof IdempotencyConflictException conflict) {
             // A benign replay never reaches here: the engine answers it as a success with

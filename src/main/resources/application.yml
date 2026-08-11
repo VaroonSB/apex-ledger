@@ -566,3 +566,9 @@ apex:
       # instead of pushing the next attempt hours past the broker's recovery.
       retry-max-delay: 5m
       backlog-probe-interval: 30s
+    invariant-check:
+      # Re-verifies the two correctness invariants (global balance, projection drift).
+      # Deliberately slow: both queries aggregate the whole journal, so this must never
+      # be wired to a Prometheus scrape. See LedgerInvariantMetrics.
+      interval: 5m
+      initial-delay: 30s
