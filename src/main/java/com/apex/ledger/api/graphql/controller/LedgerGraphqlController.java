@@ -15,7 +15,9 @@ import com.apex.ledger.domain.model.CurrencyCode;
 import com.apex.ledger.domain.model.Direction;
 import com.apex.ledger.domain.model.IdempotencyKey;
 import com.apex.ledger.domain.model.Money;
+import com.apex.ledger.config.ResilienceConfig;
 import com.apex.ledger.domain.model.TransactionKind;
+import io.github.resilience4j.ratelimiter.annotation.RateLimiter;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -157,7 +159,24 @@ public class LedgerGraphqlController {
      *
      * <p>The engine remains N-leg; this mutation exposes the two-leg case only. FX through a position
      * account and fee splits need the multi-leg form, which this phase does not publish.
+     *
+     * <h2>Rate limiting</h2>
+     *
+     * <p>Guarded by a Resilience4j rate limiter, configured in {@link ResilienceConfig}. It sits on the
+     * <em>outermost</em> layer on purpose: a shed request must be refused before it has taken a JDBC
+     * connection, a distributed lock or a transaction, because the whole point is to stop a spike from
+     * saturating the connection pool. A limiter placed inside the engine would already have paid those
+     * costs by the time it rejected.
+     *
+     * <p>Rejection surfaces as {@code RequestNotPermitted}, which {@code LedgerExceptionResolver} maps to
+     * a retryable {@code RATE_LIMITED} GraphQL error. Nothing is written, so a client may retry with
+     * backoff — and reusing the same idempotency key is safe, since a rejected request never consumed it.
+     *
+     * <p>Only the mutation is limited. The read queries are cheap, cacheable and cannot exhaust the
+     * pool the way a write can; throttling them would degrade dashboards during exactly the incident an
+     * operator needs them for.
      */
+    @RateLimiter(name = ResilienceConfig.POST_TRANSACTION_LIMITER)
     @MutationMapping
     public PostTransactionPayload postTransaction(@Argument @Valid PostTransactionInput input) {
         CurrencyCode currency = CurrencyCode.of(input.currency());

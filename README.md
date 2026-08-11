@@ -5,9 +5,9 @@ A production-grade, highly concurrent, multi-currency **double-entry ledger engi
 Spring Boot 3.5.16 · Java 21 (virtual threads) · Spring GraphQL · PostgreSQL 16 · Redis 7 · Apache
 Kafka 4 (KRaft)
 
-> **Status: Phase 4 complete — GraphQL API and event-driven pipeline.** The full path is in place and
-> verified end to end: GraphQL mutation → engine → outbox (same commit) → relay → Kafka → audit
-> consumer.
+> **Status: complete (Phase 5).** Observability, resilience and a container-backed concurrency suite
+> are in place. The full path is verified end to end: GraphQL mutation → engine → outbox (same
+> commit) → relay → Kafka → audit consumer, under a 50-way virtual-thread stampede.
 
 ---
 
@@ -280,8 +280,85 @@ unique — the postings of one transaction share a timestamp.
 | Page-size cap | `first: 1000000` returns at most 100 |
 | Batch loading | a page of statement lines resolves `transaction` in one query |
 
-## Phase 5 (not yet implemented)
+## Observability
 
-Authentication and authorisation on the API · consumer-side balance projections onto the compacted
-topic · Redis `SET NX` idempotency fast path · a multi-leg `postJournalEntries` mutation for FX and
-fee splits · operational runbook for abandoned outbox events.
+Timers and counters live **inside** the services that record them — a config class cannot time a
+method body. `ObservabilityConfig` makes them usable: SLO histogram buckets on the posting and
+lock-acquisition timers (explicit buckets, because client-side percentiles cannot be aggregated
+across instances), the `@Timed`/`@Counted` aspects, and a **cardinality guard** that denies any
+ledger meter tagged with an account or transaction id. That last one is a guard against the easiest
+way to take down a monitoring system from application code: one time series per account, growing
+forever.
+
+The two most important numbers the system produces are correctness, not health:
+
+| Gauge | Must be | Meaning |
+|---|---|---|
+| `apex.ledger.invariant.unbalanced.currencies` | `0` | A currency whose journal does not sum to zero |
+| `apex.ledger.invariant.drifted.accounts` | `0` | A projection disagreeing with the journal |
+| `apex.ledger.invariant.last.check.timestamp` | advancing | Freshness — a stale gauge reads as healthy |
+
+Both aggregate the whole journal, so they are computed on a **5-minute schedule** and published into
+an `AtomicLong` the gauge reads. Wiring them directly to a Prometheus scrape would run a full-table
+aggregation every fifteen seconds forever, and the monitoring would become the outage. They start at
+`-1`, not `0`, so "never checked" is distinguishable from "verified healthy".
+
+## Resilience
+
+A Resilience4j rate limiter guards `postTransaction` at **200 permits/second per instance**, sized
+against the real bottleneck — the 32-connection JDBC pool — not picked round. Two deliberate
+properties:
+
+- **Rejection is immediate** (`timeoutDuration = 0`). Queuing would convert a throughput problem
+  into a latency one, and a client blocked for seconds may time out locally and resubmit while the
+  original is still in flight.
+- **The limit is per instance, not per cluster.** N replicas admit N × 200/s. That is correct for
+  defending each process's own pool, but it is not a global quota; a cluster-wide limit would need
+  shared state and a Redis round trip in front of every mutation.
+
+It is admission control, never a correctness control — every ledger guarantee holds with it disabled.
+A shed request writes nothing and does not consume its idempotency key, so the same request can be
+retried with the same key.
+
+## The concurrency suite
+
+`LedgerConcurrencyIntegrationTest` — **zero mocks**: PostgreSQL, Redis and Kafka are all
+Testcontainers. That is not a preference. Every guarantee is enforced by infrastructure — a trigger,
+a CHECK constraint, a unique index, a Redisson lease — so a mocked repository would return whatever
+the author expected and prove nothing.
+
+Load is generated with `newVirtualThreadPerTaskExecutor` and released through a `CountDownLatch`
+starting gate, so 50 requests actually collide instead of arriving spread over however long they take
+to submit.
+
+| Scenario | Assertion |
+|---|---|
+| 50 threads, same idempotency key | exactly **1** posting; balance moved once, not 50× |
+| 10 distinct keys × 5 duplicates | exactly **10** postings, one per key |
+| 50 threads racing a balance covering one | exactly **1** funded; floored at `0.00`, never negative |
+| 50 threads, balance covering ten | balance equals `100.00 − 10.00 × successes` exactly |
+| 50 opposing transfers on one pair | no deadlock; value conserved between the pair |
+| 50 postings → outbox → Kafka | one event per committed transaction, all published |
+| Rate limiter drained | `RATE_LIMITED`, nothing written, key not consumed |
+| 50 concurrent mutations via GraphQL | balance equals exactly the number of accepted requests |
+
+Every scenario ends on the same three database-side questions: does every currency balance, has any
+projection drifted, is any account below its floor. Counting successes alone would pass on a ledger
+that had also corrupted a balance.
+
+Assertions tolerate **shed load** (a lock timeout or a rate-limit rejection) as a valid outcome that
+writes nothing, rather than asserting contention never happens — which would be a claim about
+scheduling luck, not correctness. Verified across two consecutive runs: 10/10 both times, with 3 lock
+timeouts in one earlier run and 0 in these, and the assertions holding either way.
+
+## Running the tests
+
+```bash
+mvn test                  # unit suite; no Docker required
+mvn verify                # adds the four integration tests; needs a container runtime
+mvn verify -DskipITs      # unit suite only
+```
+
+`*IT` and `*IntegrationTest` both run under failsafe. The latter is excluded from surefire
+explicitly — it matches surefire's default `*Test` pattern, so without that exclusion a
+container-backed test would run during `mvn test` and fail on any machine without Docker.

@@ -50,6 +50,13 @@
         -->
         <redisson.version>3.52.0</redisson.version>
 
+        <!--
+          Also unmanaged by spring-boot-dependencies. The 2.x line is the Spring Boot 3
+          line; resilience4j-spring-boot3 is the correct artifact (the -spring-boot2 one
+          targets javax.* and will not even load).
+        -->
+        <resilience4j.version>2.4.0</resilience4j.version>
+
         <!-- Integration tests are the *IT classes driven by failsafe; unit tests are *Test / *Tests. -->
         <skipITs>false</skipITs>
     </properties>
@@ -183,6 +190,45 @@
         <dependency>
             <groupId>org.springframework.kafka</groupId>
             <artifactId>spring-kafka</artifactId>
+        </dependency>
+
+        <!-- ============================================================== -->
+        <!-- Resilience                                                     -->
+        <!-- ============================================================== -->
+
+        <!--
+          Rate limiting for the posting mutation. The starter contributes the
+          @RateLimiter aspect, Spring Boot configuration binding, and — because
+          Micrometer is on the classpath — automatic registration of the limiter's
+          metrics, so permitted/rejected counts land in Prometheus without extra wiring.
+        -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-spring-boot3</artifactId>
+            <version>${resilience4j.version}</version>
+        </dependency>
+
+        <!--
+          Micrometer bindings for Resilience4j, so the rate limiter's available-permits
+          gauge and its call counters are exported alongside the ledger's own meters
+          rather than only being visible through the actuator's own endpoint.
+        -->
+        <dependency>
+            <groupId>io.github.resilience4j</groupId>
+            <artifactId>resilience4j-micrometer</artifactId>
+            <version>${resilience4j.version}</version>
+        </dependency>
+
+        <!--
+          Declared explicitly rather than relied upon transitively. Both @RateLimiter and
+          Micrometer's @Timed/@Counted are AOP-driven, and aspectjweaver currently arrives
+          only as a transitive dependency — a future upgrade that drops it would silently
+          turn every annotation into a no-op, which for a rate limiter means the protection
+          disappearing without a single test failing.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aop</artifactId>
         </dependency>
 
         <!-- ============================================================== -->
@@ -365,6 +411,13 @@
                 <configuration>
                     <excludes>
                         <exclude>**/*IT.java</exclude>
+                        <!--
+                          *IntegrationTest also matches surefire's default *Test pattern, so
+                          without this exclusion a container-backed test would run during
+                          `mvn test` and fail on any machine without a container runtime.
+                          Failsafe picks it up instead — see its includes below.
+                        -->
+                        <exclude>**/*IntegrationTest.java</exclude>
                     </excludes>
                     <!-- Deterministic time zone: ledger timestamps are asserted in UTC. -->
                     <argLine>-Duser.timezone=UTC -Dfile.encoding=UTF-8</argLine>
@@ -385,6 +438,7 @@
                 <configuration>
                     <includes>
                         <include>**/*IT.java</include>
+                        <include>**/*IntegrationTest.java</include>
                     </includes>
                     <skipITs>${skipITs}</skipITs>
                     <argLine>-Duser.timezone=UTC -Dfile.encoding=UTF-8</argLine>

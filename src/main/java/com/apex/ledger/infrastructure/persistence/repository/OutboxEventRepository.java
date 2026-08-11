@@ -1,5 +1,6 @@
 package com.apex.ledger.infrastructure.persistence.repository;
 
+import com.apex.ledger.domain.model.OutboxStatus;
 import com.apex.ledger.infrastructure.persistence.entity.OutboxEvent;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -7,6 +8,7 @@ import org.springframework.data.repository.Repository;
 import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -25,7 +27,26 @@ public interface OutboxEventRepository extends Repository<OutboxEvent, Long> {
 
     Optional<OutboxEvent> findByEventId(UUID eventId);
 
-    long countByStatus(String status);
+    /**
+     * Events in a given dispatch state.
+     *
+     * <p>Takes the {@link OutboxStatus} enum, not a {@code String}. The field is {@code @Enumerated}, so
+     * Spring Data binds this parameter as the enum; a {@code String} signature compiles and then fails at
+     * runtime with {@code Argument [PENDING] of type [java.lang.String] did not match parameter type} —
+     * the same defect class that a {@code String} idempotency-key lookup produced earlier in this project,
+     * and one no compiler catches.
+     */
+    long countByStatus(OutboxStatus status);
+
+    /**
+     * Every event staged for the given aggregates, regardless of dispatch status.
+     *
+     * <p>Status-independent on purpose. Anything that filters on {@code PENDING} races the relay, which
+     * is draining continuously — a caller asking "was an event written for this transaction?" wants the
+     * answer whether or not it has already been published. Used for support lookups and for assertions
+     * that must not depend on relay timing.
+     */
+    List<OutboxEvent> findByAggregateIdIn(Collection<UUID> aggregateIds);
 
     /**
      * Claims a batch of events for publication.
