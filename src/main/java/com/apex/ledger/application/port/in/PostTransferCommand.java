@@ -53,7 +53,6 @@ public record PostTransferCommand(
         Objects.requireNonNull(idempotencyKey, "idempotencyKey must not be null");
         Objects.requireNonNull(kind, "kind must not be null");
         Objects.requireNonNull(legs, "legs must not be null");
-        Objects.requireNonNull(effectiveAt, "effectiveAt must not be null");
         Objects.requireNonNull(createdBy, "createdBy must not be null");
         if (createdBy.isBlank()) {
             throw new IllegalArgumentException("createdBy must not be blank");
@@ -65,16 +64,20 @@ public record PostTransferCommand(
         // Defensive copy: the command is passed across a lock boundary and must not change underneath.
         legs = List.copyOf(legs);
 
-        // Truncate to microseconds, the resolution PostgreSQL TIMESTAMPTZ actually stores.
+        // effectiveAt is OPTIONAL, and that is load-bearing for idempotency.
         //
-        // This is a correctness fix, not tidiness. effectiveAt participates in the request
-        // fingerprint, and Instant.now() on Java 21 carries nanoseconds. Left untruncated, the value
-        // in a command and the value read back from the database differ in their sub-microsecond
-        // digits, so a fingerprint recomputed from persisted data never matches the stored one — and
-        // any reconciliation or replay-detection built on that comparison silently reports every
-        // request as "key reused with a different payload". Normalising once, here at the boundary,
-        // makes the fingerprint stable across a persist/reload round trip.
-        effectiveAt = effectiveAt.truncatedTo(ChronoUnit.MICROS);
+        // It participates in the request fingerprint, so it must contain only what the CLIENT sent. If
+        // a caller omits it and the server fills in `now`, every retry produces a different
+        // fingerprint and the second attempt is rejected as "key reused with a different payload" —
+        // the exact opposite of idempotency, and it would break every client that does not send an
+        // explicit business date. The default is therefore applied at persist time, after the
+        // fingerprint is taken, not here.
+        //
+        // When supplied it is truncated to microseconds, the resolution PostgreSQL TIMESTAMPTZ
+        // stores. Untruncated, the value in a command and the value read back from the database
+        // differ in their sub-microsecond digits, so a fingerprint recomputed from persisted data
+        // could never match the stored one.
+        effectiveAt = effectiveAt == null ? null : effectiveAt.truncatedTo(ChronoUnit.MICROS);
 
         boolean requiresLink = kind.requiresReversedTransaction();
         if (requiresLink != (reversesTransactionId != null)) {
@@ -104,8 +107,9 @@ public record PostTransferCommand(
      * </ul>
      *
      * <p>{@code createdBy} is included: the same movement requested by a different actor is a different
-     * request for audit purposes. {@code effectiveAt} is included for the same reason — a backdated
-     * correction is not a replay of today's posting.
+     * request for audit purposes. An explicitly supplied {@code effectiveAt} is included for the same
+     * reason — a backdated correction is not a replay of today's posting — but an omitted one
+     * contributes nothing, so a client that never sends a business date can still retry safely.
      */
     public String canonicalForm() {
         StringJoiner legJoiner = new StringJoiner("|");
@@ -121,7 +125,8 @@ public record PostTransferCommand(
 
         return new StringJoiner("\n")
                 .add("kind=" + kind)
-                .add("effectiveAt=" + effectiveAt)
+                // Empty when the client omitted it, so a retry that also omits it matches.
+                .add("effectiveAt=" + (effectiveAt == null ? "" : effectiveAt))
                 .add("createdBy=" + createdBy)
                 .add("reference=" + (reference == null ? "" : reference))
                 .add("description=" + (description == null ? "" : description))

@@ -8,6 +8,8 @@ import org.springframework.data.repository.Repository;
 import org.springframework.data.repository.query.Param;
 
 import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -57,6 +59,57 @@ public interface JournalEntryRepository extends Repository<JournalEntry, UUID> {
              where account_id = :accountId
             """, nativeQuery = true)
     BigDecimal sumSignedAmountByAccountId(@Param("accountId") UUID accountId);
+
+    /**
+     * First page of an account's statement, newest first.
+     *
+     * <p>Ordered by {@code (created_at DESC, id DESC)} to match
+     * {@code idx_journal_entries_account_created}, so this is an index seek rather than a sort. The id
+     * is part of the ordering, not decoration: {@code created_at} is not unique — a batch of postings
+     * in one transaction shares a timestamp — and an ordering with ties has no stable cursor position,
+     * which would make pagination skip or repeat rows.
+     */
+    @Query(value = """
+            select *
+              from journal_entries
+             where account_id = :accountId
+             order by created_at desc, id desc
+             limit :limit
+            """, nativeQuery = true)
+    List<JournalEntry> findFirstPageByAccountId(@Param("accountId") UUID accountId,
+                                               @Param("limit") int limit);
+
+    /**
+     * Subsequent page, seeking past the entry a cursor names.
+     *
+     * <p>Uses PostgreSQL row-value comparison, {@code (created_at, id) < (?, ?)}, which is exactly the
+     * lexicographic predicate the composite index supports — one seek, no offset. Writing it as
+     * {@code created_at < ? OR (created_at = ? AND id < ?)} would be logically equivalent but the
+     * planner will not always drive it from the index.
+     *
+     * <p>Kept as a separate method from the first page rather than folding the cursor into a nullable
+     * parameter: a null timestamptz in a native query needs an explicit cast to bind, and two clear
+     * queries read better than one with a null-guard in the predicate.
+     */
+    @Query(value = """
+            select *
+              from journal_entries
+             where account_id = :accountId
+               and (created_at, id) < (:afterCreatedAt, :afterId)
+             order by created_at desc, id desc
+             limit :limit
+            """, nativeQuery = true)
+    List<JournalEntry> findPageByAccountIdAfter(@Param("accountId") UUID accountId,
+                                               @Param("afterCreatedAt") Instant afterCreatedAt,
+                                               @Param("afterId") UUID afterId,
+                                               @Param("limit") int limit);
+
+    /**
+     * Entries for several transactions at once, for the GraphQL batch loader behind
+     * {@code Transaction.entries}. Without it, a page of 100 transactions would issue 100 queries.
+     */
+    List<JournalEntry> findByTransactionIdInOrderByTransactionIdAscEntrySequenceAsc(
+            Collection<UUID> transactionIds);
 
     /**
      * Global double-entry check: the signed sum of every posting in every currency.

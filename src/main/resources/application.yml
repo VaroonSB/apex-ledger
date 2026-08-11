@@ -545,3 +545,24 @@ apex:
       journal-entries: apex.ledger.journal-entries.v1
       balance-projections: apex.ledger.balance-projections.v1
       dead-letter: apex.ledger.dlq.v1
+    outbox:
+      # Relay cadence. fixedDelay is measured from the end of the previous run, so a
+      # slow batch cannot cause ticks to overlap.
+      poll-interval: 500ms
+      # Let the application finish starting before the first tick, so a rolling deploy
+      # does not have every fresh instance hit Kafka while it is still warming up.
+      initial-delay: 5s
+      batch-size: 100
+      # Must stay under the transaction timeout: the batch holds SKIP LOCKED row locks
+      # for its whole duration, and a send that outlives the transaction would keep
+      # rows claimed after the locks were released.
+      send-timeout: 10s
+      # Past this the event is ABANDONED rather than retried forever. An abandoned
+      # event is a committed ledger change consumers will never see — it needs an
+      # operator, not another retry.
+      max-attempts: 10
+      retry-base-delay: 2s
+      # Caps the exponential backoff so a long outage settles into a steady cadence
+      # instead of pushing the next attempt hours past the broker's recovery.
+      retry-max-delay: 5m
+      backlog-probe-interval: 30s
