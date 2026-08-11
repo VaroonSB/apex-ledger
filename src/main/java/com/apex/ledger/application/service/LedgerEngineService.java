@@ -6,7 +6,7 @@ import com.apex.ledger.application.port.out.AccountBalanceProjection;
 import com.apex.ledger.application.port.out.AccountLockManager;
 import com.apex.ledger.application.port.out.IdempotencyGuard;
 import com.apex.ledger.config.ApexLedgerProperties;
-import com.apex.ledger.domain.event.JournalEntryPostedEvent;
+import com.apex.ledger.domain.event.TransactionSettledEvent;
 import com.apex.ledger.domain.exception.AccountNotPostableException;
 import com.apex.ledger.domain.exception.CurrencyMismatchException;
 import com.apex.ledger.domain.exception.IdempotencyConflictException;
@@ -266,15 +266,18 @@ public class LedgerEngineService {
     public PersistedPosting persistPosting(PostTransferCommand command,
                                            RequestFingerprint fingerprint) {
         Instant now = clock.instant();
+        // Default the business date HERE, after the fingerprint was taken in doPost. Defaulting it in
+        // the command would put a server-generated value into the fingerprint and break retries.
+        Instant effectiveAt = command.effectiveAt() == null ? now : command.effectiveAt();
 
         validateAccounts(command);
 
         Transaction header = command.kind().requiresReversedTransaction()
                 ? Transaction.reversalOf(command.reversesTransactionId(), command.idempotencyKey(),
-                fingerprint, command.reference(), command.description(), command.effectiveAt(),
+                fingerprint, command.reference(), command.description(), effectiveAt,
                 now, command.createdBy())
                 : Transaction.of(command.idempotencyKey(), fingerprint, command.kind(),
-                command.reference(), command.description(), command.effectiveAt(), now,
+                command.reference(), command.description(), effectiveAt, now,
                 command.createdBy());
 
         List<JournalEntry> entries = new ArrayList<>(command.legs().size());
@@ -284,19 +287,19 @@ public class LedgerEngineService {
                     leg.direction(), leg.amount(), now));
         }
 
-        JournalEntryPostedEvent event = buildEvent(header, entries, now);
+        TransactionSettledEvent event = buildEvent(header, entries, now);
         OutboxEvent outboxEvent = OutboxEvent.pending(
                 AGGREGATE_TYPE,
                 header.getId(),
-                JournalEntryPostedEvent.eventType(),
+                TransactionSettledEvent.eventType(),
                 journalEntriesTopic,
                 // Keyed by transaction, not by account: a transaction can touch many accounts, and one
                 // record cannot be keyed by all of them. Downstream consumers that need per-account
                 // ordering must re-key onto an account-partitioned topic; see the class notes in
-                // JournalEntryPostedEvent.
+                // TransactionSettledEvent.
                 header.getId().toString(),
                 serialize(event),
-                serialize(Map.of("eventType", JournalEntryPostedEvent.eventType(),
+                serialize(Map.of("eventType", TransactionSettledEvent.eventType(),
                         "aggregateType", AGGREGATE_TYPE)),
                 now,
                 now);
@@ -479,11 +482,11 @@ public class LedgerEngineService {
     // Serialization
     // ------------------------------------------------------------------------
 
-    private JournalEntryPostedEvent buildEvent(Transaction header,
+    private TransactionSettledEvent buildEvent(Transaction header,
                                                List<JournalEntry> entries,
                                                Instant postedAt) {
-        List<JournalEntryPostedEvent.Entry> eventEntries = entries.stream()
-                .map(entry -> new JournalEntryPostedEvent.Entry(
+        List<TransactionSettledEvent.Entry> eventEntries = entries.stream()
+                .map(entry -> new TransactionSettledEvent.Entry(
                         entry.getId(),
                         entry.getAccountId(),
                         entry.getEntrySequence(),
@@ -492,7 +495,7 @@ public class LedgerEngineService {
                         entry.getCurrency().code()))
                 .toList();
 
-        return new JournalEntryPostedEvent(
+        return new TransactionSettledEvent(
                 UUID.randomUUID(),
                 header.getId(),
                 header.getKind().name(),

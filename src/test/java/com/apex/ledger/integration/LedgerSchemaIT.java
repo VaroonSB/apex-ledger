@@ -333,7 +333,7 @@ class LedgerSchemaIT {
     @Test
     void outbox_row_transitions_through_dispatch_states() {
         OutboxEvent staged = tx.execute(s -> outbox.save(OutboxEvent.pending(
-                "Transaction", UUID.randomUUID(), "JournalEntryPosted",
+                "Transaction", UUID.randomUUID(), "TransactionSettled",
                 "apex.ledger.journal-entries.v1", "acct-1", "{\"amount\":\"100.00\"}", null,
                 Instant.now(), Instant.now())));
         assertThat(staged.getId()).isNotNull();

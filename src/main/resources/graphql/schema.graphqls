@@ -1,27 +1,325 @@
 """
-ApexLedger GraphQL schema — root definition.
+ApexLedger GraphQL schema.
 
-Spring GraphQL fails fast at startup if no schema resource is found, so this file
-establishes the root Query type that the domain schema extends in Phase 2.
+Two custom scalars carry money and time; both are registered in LedgerScalars.
 
-Phase 2 adds, in separate .graphqls files picked up by the
-`classpath:graphql/**/` pattern:
-  * custom scalars (Decimal, DateTime, UUID, CurrencyCode) with their
-    RuntimeWiringConfigurer registrations,
-  * Account / JournalEntry / Posting / Balance types,
-  * the postTransfer mutation, carrying a client-supplied idempotency key.
-
-Every field added later must be resolved by a controller mapping:
-`spring.graphql.schema.inspection.enabled=true` reports unmapped fields at
-startup rather than returning nulls at request time.
+  Decimal  — an exact decimal. Accepts a STRING or an exact JSON number, never a
+             float that has already lost precision. Always serialised as a string
+             in plain notation, so a JavaScript client cannot silently coerce a
+             balance into an IEEE double.
+  DateTime — ISO-8601 instant in UTC.
 """
+scalar Decimal
+scalar DateTime
+
+# ===========================================================================
+# Enums — mirrored from the domain, so a client can exhaustively switch on them
+# ===========================================================================
+
+"Which side of the ledger a posting lands on. Amounts are always positive; this carries the sign."
+enum Direction {
+    DEBIT
+    CREDIT
+}
+
+"The five classical account classifications."
+enum AccountType {
+    ASSET
+    LIABILITY
+    EQUITY
+    REVENUE
+    EXPENSE
+}
+
+enum AccountStatus {
+    "Open for posting."
+    ACTIVE
+    "Temporarily blocked; reversible."
+    FROZEN
+    "Permanently retired. History is retained; no further postings."
+    CLOSED
+}
+
+enum TransactionKind {
+    TRANSFER
+    ADJUSTMENT
+    REVERSAL
+}
+
+# ===========================================================================
+# Queries
+# ===========================================================================
+
 type Query {
     """
-    Transport-level readiness probe. Confirms the GraphQL HTTP endpoint, the
-    schema and the controller wiring are all live, without touching PostgreSQL,
-    Redis or Kafka. Use /actuator/health for dependency health.
-
-    Returns the literal string "pong".
+    Transport-level readiness probe. Touches no infrastructure; use /actuator/health
+    for dependency health.
     """
     ping: String!
+
+    """
+    The current balance of an account.
+
+    Served from the Redis balance cache when warm and read through to PostgreSQL when
+    not, so a dashboard polling this does not consume posting capacity.
+
+    IMPORTANT: this value is advisory. It is correct as of `asOf`, and the interval
+    between reading it and acting on it is unbounded. Never use it to decide whether a
+    debit is affordable — submit the posting and let the ledger reject it. The
+    authority is a database constraint evaluated inside the posting transaction.
+
+    Returns null if no such account exists.
+    """
+    getAccountBalance(accountId: ID!): AccountBalance
+
+    """
+    An account's statement: its journal entries, newest first, with cursor pagination.
+
+    Cursors are opaque and keyset-based, encoding the `(createdAt, id)` of an entry
+    rather than an offset. That matters on a ledger, because the journal is append-only
+    and grows while a client pages: an offset-based page 2 would silently skip or repeat
+    entries as new postings arrive ahead of it. A keyset cursor names a fixed position in
+    a total order, so paging is stable no matter how much is inserted concurrently, and
+    each page is an index seek rather than a growing scan.
+
+    Do not construct or parse cursors; treat them as opaque and pass back what
+    `pageInfo.endCursor` returned.
+    """
+    getTransactionHistory(
+        accountId: ID!,
+        "Page size. Defaults to 20, capped at 100."
+        first: Int,
+        "Opaque cursor from a previous page's `pageInfo.endCursor`."
+        after: String
+    ): JournalEntryConnection!
+
+    "A single transaction with its full set of journal entries."
+    getTransaction(transactionId: ID!): Transaction
+}
+
+# ===========================================================================
+# Mutations
+# ===========================================================================
+
+type Mutation {
+    """
+    Posts a balanced two-account transaction.
+
+    ## Direction semantics — read this before using it
+
+    This mutation follows the accounting convention "debit where value goes, credit
+    where it comes from":
+
+      * `sourceAccountId`      is CREDITED
+      * `destinationAccountId` is DEBITED
+
+    Whether that raises or lowers a given account's *balance* depends on the account's
+    type, because a debit increases an ASSET and decreases a LIABILITY. Two worked
+    examples with the same input shape:
+
+      * cash (ASSET) → cash (ASSET): source credited so its balance falls, destination
+        debited so its balance rises. Reads exactly like "moving money".
+      * cash (ASSET) as destination, customer deposits (LIABILITY) as source: cash is
+        debited and the liability credited, so BOTH balances rise. This is a deposit,
+        and it is correct double-entry — value entered the system rather than moving
+        within it.
+
+    There is deliberately no attempt to infer intent from account types. A rule like
+    "always lower the source's balance" cannot be expressed in double-entry: applied to a
+    mixed asset/liability pair it produces two credits, which do not sum to zero and are
+    not a valid transaction.
+
+    Multi-leg postings — FX through a position account, fee splits, settlement fan-out —
+    are not expressible here. The engine models N legs natively; a `postJournalEntries`
+    mutation exposing that is out of scope for this phase.
+
+    ## Idempotency
+
+    `idempotencyKey` is required. Resubmitting the identical request returns the original
+    outcome with `replayed: true` and posts nothing further. Reusing the key with a
+    *different* request is an error, not a replay: answering it with the first
+    transaction would report a movement of money that never happened.
+
+    A request that fails validation does not consume its key, so a caller may correct
+    the payload and resubmit with the same one.
+    """
+    postTransaction(input: PostTransactionInput!): PostTransactionPayload!
+}
+
+input PostTransactionInput {
+    "Account to CREDIT — where the value comes from."
+    sourceAccountId: ID!
+
+    "Account to DEBIT — where the value goes."
+    destinationAccountId: ID!
+
+    """
+    Amount to post, strictly positive. Must not be more precise than the currency
+    permits: 1.005 USD is rejected rather than rounded, because a ledger that rounds
+    silently accumulates a drift nobody can later attribute.
+    """
+    amount: Decimal!
+
+    "ISO-4217 code. Must match the currency of both accounts."
+    currency: String!
+
+    "Client-supplied deduplication key, 1–255 characters, no surrounding whitespace."
+    idempotencyKey: String!
+
+    "Optional external correlation reference."
+    reference: String
+
+    "Optional human-readable description."
+    description: String
+
+    """
+    Business date this transaction belongs to. Defaults to now.
+
+    Distinct from the system-recorded time: a backdated correction needs both to stay
+    auditable. Truncated to microseconds, the resolution the store keeps.
+    """
+    effectiveAt: DateTime
+}
+
+type PostTransactionPayload {
+    "The committed transaction."
+    transaction: Transaction!
+
+    """
+    True when this was a replay of an earlier identical submission and nothing new was
+    posted. Still a success — that is what idempotency means to a client that retried.
+    """
+    replayed: Boolean!
+
+    """
+    Balances of the affected accounts immediately after the commit, read from
+    PostgreSQL rather than from cache. Empty for a replay, where no new balance was
+    produced.
+    """
+    balancesAfter: [AccountBalance!]!
+}
+
+# ===========================================================================
+# Types
+# ===========================================================================
+
+type AccountBalance {
+    accountId: ID!
+    accountNumber: String!
+    accountType: AccountType!
+    status: AccountStatus!
+    currency: String!
+
+    """
+    Signed balance, positive on the account type's natural side: debits minus credits
+    for ASSET and EXPENSE, credits minus debits for the rest.
+    """
+    balance: Decimal!
+
+    "Lifetime sum of debit postings. Monotonically increasing."
+    totalDebits: Decimal!
+
+    "Lifetime sum of credit postings. Monotonically increasing."
+    totalCredits: Decimal!
+
+    "Hard floor below which a posting is rejected. Null means no floor."
+    minimumBalance: Decimal
+
+    "When this balance was observed. It may already be stale by the time you read it."
+    asOf: DateTime!
+}
+
+"An immutable transaction header. Append-only: a correction is a new REVERSAL, never an edit."
+type Transaction {
+    id: ID!
+    kind: TransactionKind!
+    idempotencyKey: String!
+    reference: String
+    description: String
+
+    "Business date this transaction belongs to."
+    effectiveAt: DateTime!
+
+    "When the system recorded it."
+    createdAt: DateTime!
+
+    createdBy: String!
+
+    "Set only on a REVERSAL: the transaction this one offsets."
+    reversesTransactionId: ID
+
+    """
+    The postings of this transaction, ordered by sequence.
+
+    Resolved by a batch loader, so requesting this field across a page of transactions
+    issues one query rather than one per transaction.
+    """
+    entries: [JournalEntry!]!
+}
+
+"""
+A single immutable posting. The audit truth of the system: every balance anywhere is a
+projection of these rows.
+"""
+type JournalEntry {
+    id: ID!
+    accountId: ID!
+
+    "Position within the owning transaction, 0-based."
+    entrySequence: Int!
+
+    direction: Direction!
+
+    "Always strictly positive. The sign lives in `direction`."
+    amount: Decimal!
+
+    currency: String!
+
+    "The amount with the direction's sign applied: positive for a debit, negative for a credit."
+    signedAmount: Decimal!
+
+    createdAt: DateTime!
+
+    """
+    The transaction this posting belongs to.
+
+    Resolved by a batch loader, so a page of 100 entries costs one transaction query
+    rather than 100.
+    """
+    transaction: Transaction!
+}
+
+# ===========================================================================
+# Pagination — Relay Connection shape
+# ===========================================================================
+
+"""
+A page of journal entries.
+
+Note the absence of a `totalCount`. It is omitted deliberately rather than overlooked:
+the journal is append-only and unbounded, so `COUNT(*)` for an account is work that
+grows forever and would be paid on every page request. Nor is it derivable from the
+account's projection columns — those are sums of amounts, not counts of rows. If a total
+is genuinely needed it should come from a counter maintained per posting (a schema
+change), so the cost is paid once at write time instead of on every read.
+
+Cursor pagination does not need it: `pageInfo.hasNextPage` is what drives "load more".
+"""
+type JournalEntryConnection {
+    edges: [JournalEntryEdge!]!
+    pageInfo: PageInfo!
+}
+
+type JournalEntryEdge {
+    node: JournalEntry!
+
+    "Opaque keyset cursor for this entry. Pass it back as `after` to continue."
+    cursor: String!
+}
+
+type PageInfo {
+    hasNextPage: Boolean!
+    hasPreviousPage: Boolean!
+    startCursor: String
+    endCursor: String
 }

@@ -5,10 +5,9 @@ A production-grade, highly concurrent, multi-currency **double-entry ledger engi
 Spring Boot 3.5.16 · Java 21 (virtual threads) · Spring GraphQL · PostgreSQL 16 · Redis 7 · Apache
 Kafka 4 (KRaft)
 
-> **Status: Phase 3 complete — concurrency engine, distributed locking and balance cache.** The
-> posting engine, Redisson account locking and the read-through/write-through balance cache are in
-> place and verified against a real PostgreSQL 16 and Redis 7. The GraphQL API and the Kafka outbox
-> relay arrive in Phase 4.
+> **Status: Phase 4 complete — GraphQL API and event-driven pipeline.** The full path is in place and
+> verified end to end: GraphQL mutation → engine → outbox (same commit) → relay → Kafka → audit
+> consumer.
 
 ---
 
@@ -230,8 +229,59 @@ that can expire mid-transaction silently voids the mutual exclusion the engine b
 | Cache fence discards out-of-order writes | a stale-fence write is rejected; a newer one applies |
 | Lease expiry during posting | 0 occurrences |
 
-## Phase 4 (not yet implemented)
+## The API and event pipeline
 
-GraphQL domain schema, custom scalars and typed error mapping · the Kafka outbox relay draining
-`outbox_events` with `SKIP LOCKED` · consumer-side balance projections · Redis `SET NX` idempotency
-fast path.
+```
+GraphQL mutation ──▶ LedgerEngineService ──▶ one commit: transaction + entries + outbox row
+                                                             │
+                                    OutboxRelayService (@Scheduled, SKIP LOCKED)
+                                                             ▼
+                                              Kafka  apex.ledger.journal-entries.v1
+                                                             │
+                                                   AsyncAuditConsumer (@KafkaListener)
+```
+
+**The payload is published verbatim.** The relay sends the exact bytes committed with the ledger
+change — it never deserialises and re-serialises. Re-encoding would make the published record depend
+on this service's current Jackson configuration rather than on what was committed, so an event
+replayed from the outbox months later could differ from the one originally published.
+
+**Delivery is at-least-once, and that is inherent.** Claiming a database row and acknowledging a Kafka
+write cannot be made atomic, so the relay can publish and then fail before marking the row. Consumers
+deduplicate on the `apex-event-id` header, which is stable across every redelivery.
+
+### Money on the wire
+
+`Decimal` is serialised as a **plain-notation string**, never a JSON number. A JSON number would be
+parsed by a JavaScript client as an IEEE double, silently altering a 20-digit balance before the
+application ever saw it. On input the scalar accepts a string or an exact number and **refuses a
+`Double` outright** — by the time an amount is a `double` its precision is already gone.
+
+### Cursor pagination
+
+`getTransactionHistory` uses keyset cursors encoding `(createdAt, id)`, not offsets. On an append-only
+journal an offset shifts every time a posting lands ahead of the window, so an offset-paged client
+silently skips or repeats rows while it reads. The id is part of the key because `created_at` is not
+unique — the postings of one transaction share a timestamp.
+
+### Verified end to end
+
+| Property | Result |
+|---|---|
+| Mutation → outbox → Kafka → consumer | 27 events relayed, 27 audited, 0 DLQ, 0 abandoned |
+| Payload published byte-for-byte | record value equals the committed `payload` exactly |
+| Producer durability | `acks=all`, `enable.idempotence=true` confirmed at runtime |
+| `Decimal` on the wire | `"100.00"` as a string; scale 2 survives the jsonb round trip |
+| `Decimal` refuses a float | `parseValue(100.005d)` throws |
+| Error mapping | `IDEMPOTENCY_KEY_REUSED`, `INSUFFICIENT_FUNDS`, `INVALID_INPUT`, `INVALID_CURSOR` with `retryable` flags |
+| Idempotent replay through GraphQL | `replayed: true`, same transaction id, no second posting |
+| Cursor pagination | 7 entries at 3/page → 3 pages, each entry seen exactly once |
+| Cursor stability | new postings at the head do not shift an in-flight cursor |
+| Page-size cap | `first: 1000000` returns at most 100 |
+| Batch loading | a page of statement lines resolves `transaction` in one query |
+
+## Phase 5 (not yet implemented)
+
+Authentication and authorisation on the API · consumer-side balance projections onto the compacted
+topic · Redis `SET NX` idempotency fast path · a multi-leg `postJournalEntries` mutation for FX and
+fee splits · operational runbook for abandoned outbox events.

@@ -8,7 +8,11 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * Published when a transaction and its journal entries have been committed.
+ * Published when a transaction and its journal entries have been committed and are final.
+ *
+ * <p>"Settled" is the operative word: this event is emitted only from a committed transaction, via the
+ * outbox, so it never describes a posting that later rolled back. There is no corresponding "pending"
+ * or "failed" event — a failed posting leaves no row and therefore no event.
  *
  * <p>The outbound contract. Once consumers exist this shape can only be extended, never narrowed:
  * removing or retyping a field breaks every reader, and the Kafka topic retains history indefinitely
@@ -23,7 +27,7 @@ import java.util.UUID;
  * derive it from the entries or query the read side — embedding a balance snapshot in an event that may
  * be redelivered out of order invites consumers to treat a stale value as current.
  */
-public record JournalEntryPostedEvent(
+public record TransactionSettledEvent(
         UUID eventId,
         UUID transactionId,
         String kind,
@@ -47,12 +51,12 @@ public record JournalEntryPostedEvent(
     ) {
     }
 
-    public JournalEntryPostedEvent {
+    public TransactionSettledEvent {
         entries = List.copyOf(entries);
     }
 
     /** Stable event-type discriminator carried in the outbox row and as a Kafka header. */
     public static String eventType() {
-        return "JournalEntryPosted";
+        return "TransactionSettled";
     }
 }

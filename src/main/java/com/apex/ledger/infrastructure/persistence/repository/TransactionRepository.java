@@ -6,6 +6,8 @@ import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.repository.Repository;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -42,4 +44,10 @@ public interface TransactionRepository extends Repository<Transaction, UUID> {
     Optional<Transaction> findByReversesTransactionId(UUID reversesTransactionId);
 
     Page<Transaction> findAllByOrderByCreatedAtDesc(Pageable pageable);
+
+    /**
+     * Several transactions by id, for the GraphQL batch loader behind {@code JournalEntry.transaction}.
+     * A page of 100 statement lines resolves its transactions in one query instead of 100.
+     */
+    List<Transaction> findByIdIn(Collection<UUID> ids);
 }

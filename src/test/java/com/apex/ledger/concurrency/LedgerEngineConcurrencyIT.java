@@ -166,7 +166,7 @@ class LedgerEngineConcurrencyIT {
                 .filter(e -> e.getAggregateId().equals(result.transactionId()))
                 .findFirst().orElseThrow();
         assertThat(event.getStatus()).isEqualTo(OutboxStatus.PENDING);
-        assertThat(event.getEventType()).isEqualTo("JournalEntryPosted");
+        assertThat(event.getEventType()).isEqualTo("TransactionSettled");
         assertThat(event.getTopic()).isEqualTo("apex.ledger.journal-entries.v1");
         assertThat(event.getPartitionKey()).isEqualTo(result.transactionId().toString());
         // Assert on the parsed value, not the raw text: the payload column is jsonb, which reparses
