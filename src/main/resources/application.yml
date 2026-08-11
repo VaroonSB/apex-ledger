@@ -117,11 +117,12 @@ spring:
       # ---------------------------------------------------------------------
       auto-commit: false
 
-      # READ COMMITTED is PostgreSQL's default and is correct here: the
-      # double-spend guard is explicit pessimistic locking (SELECT ... FOR UPDATE
-      # / advisory locks) on the account rows being debited, not a global
-      # isolation escalation. Raising this to SERIALIZABLE would trade targeted
-      # contention for cluster-wide serialization failures.
+      # READ COMMITTED is PostgreSQL's default and is correct here. The
+      # double-spend guard is the balance trigger's UPDATE, which row-locks the
+      # account inside the posting transaction, plus the
+      # ck_accounts_minimum_balance CHECK it triggers — not a global isolation
+      # escalation. Raising this to SERIALIZABLE would trade a targeted row lock
+      # for cluster-wide serialization failures on unrelated postings.
       transaction-isolation: TRANSACTION_READ_COMMITTED
 
       register-mbeans: true
@@ -516,13 +517,30 @@ apex:
       # expired key turns a retry into a second posting.
       ttl: 24h
     locking:
-      # PostgreSQL transactional advisory locks: acquired inside the posting
-      # transaction and released by the database on commit or rollback, so a
-      # crashed node cannot leave an account permanently locked. Redis leases
-      # are used only for coarse-grained, non-authoritative guards.
-      key-prefix: "apex:lock:"
-      lease-time: 3s
-      wait-time: 1s
+      # Redisson distributed lock over the accounts of a posting. This is a
+      # coordination mechanism, NOT the correctness mechanism: PostgreSQL's
+      # balance trigger and ck_accounts_minimum_balance are what actually
+      # prevent a double-spend, and they hold even if this lock is lost.
+      key-prefix: "apex:lock:account:"
+      # MUST exceed spring.transaction.default-timeout (10s above). If the lease
+      # expires while the posting transaction is still running, Redis hands the
+      # lock to another node and the mutual exclusion silently stops existing —
+      # Redis cannot revoke a lease already granted. RedissonConfig asserts this
+      # ordering at startup and refuses to boot if it is violated.
+      lease-time: 15s
+      # Bounds how long a caller queues for a contended account. Kept short so a
+      # hot account sheds load as a retryable error instead of accumulating
+      # threads that each hold a JDBC connection.
+      wait-time: 2s
+    cache:
+      # Read-through/write-through balance cache. Advisory only — never consulted
+      # to authorise a posting.
+      enabled: true
+      key-prefix: "apex:balance:"
+      # A correctness backstop rather than a tuning knob: it bounds how long a
+      # balance can stay wrong if a write-through is ever lost (a node dying
+      # between COMMIT and the cache write).
+      ttl: 60s
     topics:
       journal-entries: apex.ledger.journal-entries.v1
       balance-projections: apex.ledger.balance-projections.v1

@@ -299,9 +299,12 @@ services:
       KAFKA_MIN_INSYNC_REPLICAS: 1
 
       # --- Topic defaults --------------------------------------------------
-      # 12 partitions gives room to scale consumer concurrency; ordering is
-      # preserved per key, and the producer keys on account id so all entries
-      # touching one account stay on one partition and stay strictly ordered.
+      # 12 partitions gives room to scale consumer concurrency. Ordering is
+      # preserved per key, and the outbox keys journal events by TRANSACTION id.
+      # Note what that does and does not give you: a transaction can touch many
+      # accounts, so one record cannot be keyed by all of them, and there is
+      # therefore no global per-account ordering across partitions. A consumer
+      # that needs it must re-key onto an account-partitioned topic.
       KAFKA_NUM_PARTITIONS: 12
       # Off deliberately: a typo in a topic name must fail loudly instead of
       # quietly creating a new topic. Real topics are declared as NewTopic beans.

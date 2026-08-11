@@ -79,6 +79,20 @@ public class OutboxEvent {
     /**
      * Serialised event body, stored as {@code jsonb}. Immutable: the record of what happened is never
      * rewritten, only its delivery state is.
+     *
+     * <p><strong>Not byte-preserved.</strong> {@code jsonb} parses the document and stores a
+     * canonical form, so what comes back out has normalised whitespace, reordered keys and any
+     * duplicate key dropped. Two consequences worth knowing:
+     *
+     * <ul>
+     *   <li>Never compute a signature or digest over this column and expect it to match one taken
+     *       before the write — sign the payload before it is stored, and carry the signature in a
+     *       separate field.
+     *   <li>Numeric precision <em>is</em> safe: {@code jsonb} keeps a JSON number as PostgreSQL
+     *       {@code numeric}, so a money amount neither loses its scale nor degrades to a double. That
+     *       is the property that actually matters here, and it is why {@code jsonb} is acceptable
+     *       despite the normalisation.
+     * </ul>
      */
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "payload", nullable = false, updatable = false)
