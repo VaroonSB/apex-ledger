@@ -159,7 +159,9 @@ spring:
     show-sql: false
     properties:
       hibernate:
-        dialect: org.hibernate.dialect.PostgreSQLDialect
+        # NOTE: hibernate.dialect is deliberately NOT set. Hibernate 6 resolves it from the
+        # JDBC metadata and logs HHH90000025 deprecating an explicit setting, which also
+        # risks pinning a dialect that disagrees with the connected server version.
         # Batch the postings of a journal entry into one round trip. Ordering
         # inserts/updates is what makes JDBC batching actually group statements.
         jdbc:
