@@ -4,12 +4,14 @@ import com.apex.ledger.config.ApexLedgerProperties;
 import com.apex.ledger.infrastructure.persistence.entity.OutboxEvent;
 import com.apex.ledger.infrastructure.persistence.repository.OutboxEventRepository;
 import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.header.internals.RecordHeader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
@@ -29,6 +31,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Drains {@code outbox_events} to Kafka.
@@ -77,13 +80,43 @@ public class OutboxRelayService {
     private final OutboxEventRepository outbox;
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final Clock clock;
-    private final MeterRegistry meterRegistry;
 
     private final int batchSize;
     private final Duration sendTimeout;
     private final int maxAttempts;
     private final Duration retryBaseDelay;
     private final Duration retryMaxDelay;
+
+    /**
+     * Self-reference used to invoke {@link #publishBatch()} through the Spring proxy.
+     *
+     * <p>Not optional. {@code @Transactional} is proxy-based, so calling {@code publishBatch()}
+     * unqualified from {@link #relayPendingEvents()} bypasses the interceptor entirely and the batch runs
+     * with <strong>no transaction at all</strong>. That is not a cosmetic loss: the whole reason
+     * {@code FOR UPDATE SKIP LOCKED} makes concurrent relays safe is that the row locks are held for the
+     * life of the claiming transaction. Without one, each statement commits on its own, the locks are
+     * released the instant the claim query returns, and a second worker — or the next tick — can claim
+     * and publish the same rows.
+     *
+     * <p>Verified rather than assumed: with the unqualified call,
+     * {@code TransactionSynchronizationManager.isActualTransactionActive()} reported {@code false} inside
+     * {@code publishBatch} when reached from the scheduled method, and {@code true} when the same method
+     * was called on the injected bean. Tests only ever called it the second way, which is why this
+     * survived until it was looked for.
+     */
+    private final ObjectProvider<OutboxRelayService> self;
+
+    /**
+     * Backing value for the {@code apex.ledger.outbox.backlog} gauge.
+     *
+     * <p>A mutable holder registered ONCE, rather than {@code meterRegistry.gauge(name, someLong)} on
+     * every probe. Micrometer ignores a repeat registration of the same meter id — it logs
+     * "This Gauge has been already registered, the registration will be ignored" — so the gauge keeps
+     * reporting the value from the very first call and every later update is silently dropped. For a
+     * backlog gauge that is the worst possible failure: it would read 0 forever while the outbox grew,
+     * and the one alarm that detects "postings commit but nothing reaches consumers" would never fire.
+     */
+    private final AtomicLong backlogGauge = new AtomicLong(0);
 
     private final Counter publishedCounter;
     private final Counter failedCounter;
@@ -99,17 +132,25 @@ public class OutboxRelayService {
                               @Value("${apex.ledger.outbox.send-timeout:10s}") Duration sendTimeout,
                               @Value("${apex.ledger.outbox.max-attempts:10}") int maxAttempts,
                               @Value("${apex.ledger.outbox.retry-base-delay:2s}") Duration retryBaseDelay,
-                              @Value("${apex.ledger.outbox.retry-max-delay:5m}") Duration retryMaxDelay) {
+                              @Value("${apex.ledger.outbox.retry-max-delay:5m}") Duration retryMaxDelay,
+                              ObjectProvider<OutboxRelayService> self) {
         this.outbox = Objects.requireNonNull(outbox);
         this.kafkaTemplate = Objects.requireNonNull(outboxKafkaTemplate);
         this.clock = Objects.requireNonNull(clock);
-        this.meterRegistry = Objects.requireNonNull(meterRegistry);
+        Objects.requireNonNull(meterRegistry, "meterRegistry must not be null");
         this.batchSize = batchSize;
         this.sendTimeout = sendTimeout;
         this.maxAttempts = maxAttempts;
         this.retryBaseDelay = retryBaseDelay;
         this.retryMaxDelay = retryMaxDelay;
+        this.self = Objects.requireNonNull(self);
         Objects.requireNonNull(properties, "properties must not be null");
+
+        Gauge.builder("apex.ledger.outbox.backlog", backlogGauge, AtomicLong::doubleValue)
+                .description("Events awaiting publication for over a minute. A rising value means "
+                        + "committed ledger changes are not reaching consumers.")
+                .strongReference(true)
+                .register(meterRegistry);
 
         this.publishedCounter = Counter.builder("apex.ledger.outbox.relay")
                 .tag("outcome", "published").register(meterRegistry);
@@ -141,7 +182,8 @@ public class OutboxRelayService {
     public void relayPendingEvents() {
         long startNanos = System.nanoTime();
         try {
-            int published = publishBatch();
+            // Through the proxy, NOT this.publishBatch(), so the batch actually runs in a transaction.
+            int published = self.getObject().publishBatch();
             if (published > 0) {
                 log.debug("relayed {} outbox event(s)", published);
             }
@@ -315,7 +357,7 @@ public class OutboxRelayService {
         try {
             long stalled = outbox.findStalled(
                     clock.instant().minus(Duration.ofMinutes(1)), 1_000).size();
-            meterRegistry.gauge("apex.ledger.outbox.backlog", stalled);
+            backlogGauge.set(stalled);
             if (stalled > 0) {
                 log.warn("{} outbox event(s) have been awaiting publication for over a minute",
                         stalled);

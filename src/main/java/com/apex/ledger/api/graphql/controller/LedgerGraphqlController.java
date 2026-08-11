@@ -28,7 +28,6 @@ import org.springframework.graphql.data.method.annotation.QueryMapping;
 import org.springframework.stereotype.Controller;
 import org.springframework.validation.annotation.Validated;
 
-import java.time.Clock;
 import java.time.Instant;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -68,14 +67,18 @@ public class LedgerGraphqlController {
 
     private final LedgerEngineService engine;
     private final LedgerQueryService queries;
-    private final Clock clock;
 
-    public LedgerGraphqlController(LedgerEngineService engine,
-                                   LedgerQueryService queries,
-                                   Clock clock) {
+    /**
+     * No {@code Clock} dependency, deliberately.
+     *
+     * <p>There was one, used to default {@code effectiveAt}. That default moved into the engine, because a
+     * server-generated timestamp must not enter the request fingerprint — it made every retry look like a
+     * different request. The dependency is gone with it: a field that exists only to be assigned is a
+     * false signal about what this class actually needs.
+     */
+    public LedgerGraphqlController(LedgerEngineService engine, LedgerQueryService queries) {
         this.engine = Objects.requireNonNull(engine);
         this.queries = Objects.requireNonNull(queries);
-        this.clock = Objects.requireNonNull(clock);
     }
 
     // ------------------------------------------------------------------ queries
